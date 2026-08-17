@@ -1,0 +1,188 @@
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+}
+
+body {
+    font-family: Arial, sans-serif;
+    background: #222;
+    color: #fff;
+}
+
+
+.terrain-editor {
+    width: 100%;
+    height: 100vh;
+
+    display: flex;
+    flex-direction: column;
+}
+
+
+/* BARRA SUPERIOR */
+
+.terrain-toolbar {
+    display: flex;
+    align-items: center;
+
+    gap: 20px;
+
+    padding: 15px;
+
+    background: #333;
+}
+
+.terrain-toolbar label {
+    display: flex;
+    align-items: center;
+
+    gap: 8px;
+}
+
+.terrain-toolbar input {
+    width: 70px;
+    padding: 5px;
+}
+
+.terrain-toolbar button {
+    padding: 6px 15px;
+
+    cursor: pointer;
+}
+
+
+/* CUERPO */
+
+.terrain-workspace {
+    flex: 1;
+
+    display: flex;
+
+    min-height: 0;
+}
+
+
+/* PANEL */
+
+.terrain-panel {
+    width: 220px;
+
+    padding: 15px;
+
+    background: #303030;
+
+    border-right: 1px solid #555;
+}
+
+.terrain-panel h3 {
+    margin-top: 0;
+}
+
+
+.terrain-types {
+    display: flex;
+
+    flex-direction: column;
+
+    gap: 8px;
+}
+
+
+.terrain-type {
+    width: 100%;
+
+    display: flex;
+    align-items: center;
+
+    gap: 10px;
+
+    padding: 10px;
+
+    border: 1px solid #555;
+
+    background: #404040;
+
+    color: white;
+
+    cursor: pointer;
+
+    text-align: left;
+}
+
+
+.terrain-type:hover {
+    background: #505050;
+}
+
+
+.terrain-type.selected {
+    border: 2px solid white;
+
+    background: #555;
+}
+
+
+/* COLORES */
+
+.terrain-color {
+    width: 25px;
+    height: 25px;
+
+    display: inline-block;
+
+    border: 1px solid #777;
+}
+
+
+.terrain-color.llanura {
+    background: #8fbc6b;
+}
+
+.terrain-color.bosque {
+    background: #27632a;
+}
+
+.terrain-color.montana {
+    background: #777;
+}
+
+.terrain-color.agua {
+    background: #3d82b8;
+}
+
+.terrain-color.desierto {
+    background: #d7bd72;
+}
+
+.terrain-color.carretera {
+    background: #8b7355;
+}
+
+
+/* MAPA */
+
+.terrain-container {
+    flex: 1;
+
+    overflow: auto;
+
+    padding: 20px;
+
+    background: #aaa;
+}
+
+
+#terrainCanvas {
+    display: block;
+
+    background: #aaa;
+
+    touch-action: none;
+}

@@ -1888,7 +1888,7 @@ function obtenerPosicionHex(
 ) {
 
     return renderer.hexPosition(
-        col,
+        col ,
         row
     );
 
@@ -2066,280 +2066,177 @@ function moverFicha(
    PANEL
 ===================================================== */
 
-function mostrarPanel(
-    ficha
-) {
+function mostrarPanel(hex, ficha = null) {
 
     /*
-     * Datos de la ficha seleccionada
+     * El panel siempre pertenece al HEXÁGONO seleccionado.
+     * La ficha es opcional: puede no existir.
      */
-    document
-        .getElementById(
-            "fichaNombre"
-        )
-        .textContent =
-        ficha.nombre;
 
-
-    document
-        .getElementById(
-            "fichaTipo"
-        )
-        .textContent =
-        ficha instanceof Unidad
-            ? "Unidad"
-            : "Chit";
-
-
-    document
-        .getElementById(
-            "fichaBando"
-        )
-        .textContent =
-        ficha.bando || "-";
-
-
-    document
-        .getElementById(
-            "fichaHex"
-        )
-        .textContent =
-        `${ficha.col}, ${ficha.row}`;
-
+    const panel = document.getElementById("panelFicha");
 
     const datosUnidad =
-        document
-            .getElementById(
-                "datosUnidad"
-            );
-
+        document.getElementById("datosUnidad");
 
     const datosChit =
-        document
-            .getElementById(
-                "datosChit"
-            );
+        document.getElementById("datosChit");
 
+    /*
+     * DATOS DE LA FICHA
+     *
+     * Si hay ficha seleccionada se muestran sus datos.
+     * Si no hay ficha, se ocultan.
+     */
 
-    if (
-        ficha instanceof Unidad
-    ) {
+    if (ficha) {
 
-        datosUnidad.style.display =
-            "block";
+        document.getElementById("fichaNombre").textContent =
+            ficha.nombre;
 
+        document.getElementById("fichaTipo").textContent =
+            ficha instanceof Unidad
+                ? "Unidad"
+                : "Chit";
 
-        datosChit.style.display =
-            "none";
+        document.getElementById("fichaBando").textContent =
+            ficha.bando || "-";
 
+        document.getElementById("fichaHex").textContent =
+            `${hex.col}, ${hex.row}`;
 
-        document
-            .getElementById(
-                "fichaFuerza"
-            )
-            .textContent =
-            ficha.fuerza;
+        if (ficha instanceof Unidad) {
 
+            datosUnidad.style.display = "block";
+            datosChit.style.display = "none";
 
-        document
-            .getElementById(
-                "fichaMovimiento"
-            )
-            .textContent =
-            ficha.movimiento;
+            document.getElementById("fichaFuerza").textContent =
+                ficha.fuerza;
 
+            document.getElementById("fichaMovimiento").textContent =
+                ficha.movimiento;
 
-        document
-            .getElementById(
-                "fichaDefensa"
-            )
-            .textContent =
-            ficha.defensa;
+            document.getElementById("fichaDefensa").textContent =
+                ficha.defensa;
 
+            document.getElementById("fichaPasos").textContent =
+                ficha.pasos;
 
-        document
-            .getElementById(
-                "fichaPasos"
-            )
-            .textContent =
-            ficha.pasos;
+        } else {
+
+            datosUnidad.style.display = "none";
+            datosChit.style.display = "block";
+
+            document.getElementById("fichaChitTipo").textContent =
+                ficha.tipoChit;
+
+            document.getElementById("fichaEstado").textContent =
+                ficha.estado;
+        }
 
     } else {
 
-        datosUnidad.style.display =
-            "none";
+        /*
+         * No hay ficha: ocultamos solamente los datos específicos
+         * de ficha. El panel CONTINÚA visible para mostrar el terreno.
+         */
 
+        datosUnidad.style.display = "none";
+        datosChit.style.display = "none";
 
-        datosChit.style.display =
-            "block";
+        document.getElementById("fichaNombre").textContent =
+            "Hexágono";
 
+        document.getElementById("fichaTipo").textContent =
+            "-";
 
-        document
-            .getElementById(
-                "fichaChitTipo"
-            )
-            .textContent =
-            ficha.tipoChit;
+        document.getElementById("fichaBando").textContent =
+            "-";
 
-
-        document
-            .getElementById(
-                "fichaEstado"
-            )
-            .textContent =
-            ficha.estado;
-
+        document.getElementById("fichaHex").textContent =
+            `${hex.col}, ${hex.row}`;
     }
 
-
     /*
-     * Datos del terreno del hexágono que contiene
-     * la ficha seleccionada.
+     * DATOS DEL TERRENO
      */
-    const hex =
-        mapa.obtenerHex(
-            ficha.col,
-            ficha.row
-        );
 
+    const terreno = hex.terreno;
 
-    if (
-        hex &&
-        hex.terreno
-    ) {
+    if (terreno) {
 
-        const terreno =
-            hex.terreno;
+        const tipo = terreno.tipo;
 
-
-        const tipo =
-            terreno.tipo;
-
-
-        document
-            .getElementById(
-                "terrenoTipo"
-            )
-            .textContent =
+        document.getElementById("terrenoTipo").textContent =
             tipo.nombre;
 
-
-        document
-            .getElementById(
-                "terrenoMovimiento"
-            )
-            .textContent =
+        document.getElementById("terrenoMovimiento").textContent =
             tipo.costeMovimiento;
 
-
-        document
-            .getElementById(
-                "terrenoCombate"
-            )
-            .textContent =
+        document.getElementById("terrenoCombate").textContent =
             tipo.modificadorCombate >= 0
                 ? `+${tipo.modificadorCombate}`
                 : tipo.modificadorCombate;
 
-
-        document
-            .getElementById(
-                "terrenoElevacion"
-            )
-            .textContent =
+        document.getElementById("terrenoElevacion").textContent =
             terreno.elevacion;
 
-
         /*
-         * Lista de unidades y chits presentes en el hexágono.
+         * TODAS LAS FICHAS DEL HEXÁGONO
          */
-        const contenido =
-            document
-                .getElementById(
-                    "terrenoContenido"
-                );
 
+        const contenido =
+            document.getElementById("terrenoContenido");
 
         contenido.innerHTML = "";
 
+        const fichas = hex.stack.fichas;
 
-        const fichas =
-            terreno.obtenerFichas();
-
-
-        if (
-            fichas.length === 0
-        ) {
+        if (fichas.length === 0) {
 
             const vacio =
-                document.createElement(
-                    "div"
-                );
+                document.createElement("div");
 
-            vacio.textContent =
-                "Vacío";
+            vacio.textContent = "Vacío";
 
-            contenido.appendChild(
-                vacio
-            );
+            contenido.appendChild(vacio);
 
         } else {
 
-            fichas.forEach(
-                function(otraFicha) {
+            fichas.forEach(function(otraFicha) {
 
-                    const linea =
-                        document.createElement(
-                            "div"
-                        );
+                const linea =
+                    document.createElement("div");
 
+                linea.className = "terrenoFicha";
 
-                    linea.className =
-                        "terrenoFicha";
-
-
-                    if (
-                        otraFicha.id ===
-                        ficha.id
-                    ) {
-
-                        linea.classList.add(
-                            "terrenoFichaSeleccionada"
-                        );
-
-                    }
-
-
-                    const tipoFicha =
-                        otraFicha instanceof Unidad
-                            ? "Unidad"
-                            : "Chit";
-
-
-                    linea.textContent =
-                        `${tipoFicha}: ${otraFicha.nombre}`;
-
-
-                    contenido.appendChild(
-                        linea
+                if (
+                    ficha &&
+                    otraFicha.id === ficha.id
+                ) {
+                    linea.classList.add(
+                        "terrenoFichaSeleccionada"
                     );
-
                 }
-            );
 
+                const tipoFicha =
+                    otraFicha instanceof Unidad
+                        ? "Unidad"
+                        : "Chit";
+
+                linea.textContent =
+                    `${tipoFicha}: ${otraFicha.nombre}`;
+
+                contenido.appendChild(linea);
+
+            });
         }
-
     }
 
+    /*
+     * EL PANEL SIEMPRE SE MUESTRA
+     */
 
-    document
-        .getElementById(
-            "panelFicha"
-        )
-        .classList.add(
-            "visible"
-        );
-
+    panel.classList.add("visible");
 }
 
 
@@ -2350,13 +2247,18 @@ function actualizarPanel() {
     )
         return;
 
+    const hex =
+        mapa.obtenerHex(
+            fichaSeleccionada.col,
+            fichaSeleccionada.row
+        );
 
-    document
-        .getElementById(
-            "fichaHex"
-        )
-        .textContent =
-        `${fichaSeleccionada.col}, ${fichaSeleccionada.row}`;
+    if (hex) {
+        mostrarPanel(
+            hex,
+            fichaSeleccionada
+        );
+    }
 
 }
 
@@ -2479,6 +2381,12 @@ canvas.addEventListener(
             rect.top;
 
 
+        const hex =
+            encontrarHex(
+                x,
+                y
+            );
+
         const ficha =
             encontrarFicha(
                 x,
@@ -2486,28 +2394,52 @@ canvas.addEventListener(
             );
 
 
-        if (ficha) {
+        if (hex) {
+
+            /*
+             * El panel SIEMPRE se abre al seleccionar un hexágono.
+             *
+             * - Con ficha: muestra terreno + ficha.
+             * - Sin ficha: muestra terreno + "Vacío".
+             */
 
             fichaSeleccionada =
-                ficha;
-
-
-            arrastrandoFicha =
-                true;
-
+                ficha || null;
 
             mostrarPanel(
+                hex,
                 ficha
             );
+
+            /*
+             * Si hay ficha, seguimos permitiendo arrastrarla.
+             * Si no hay ficha, el gesto desplaza el mapa.
+             */
+
+            if (ficha) {
+
+                arrastrandoFicha =
+                    true;
+
+                desplazandoMapa =
+                    false;
+
+            } else {
+
+                arrastrandoFicha =
+                    false;
+
+                desplazandoMapa =
+                    true;
+
+            }
 
         } else {
 
             fichaSeleccionada =
                 null;
 
-
             cerrarPanel();
-
 
             desplazandoMapa =
                 true;
