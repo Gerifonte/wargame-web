@@ -247,6 +247,106 @@ body {
 }
 
 
+/* TEXTURA DE RUIDO POR CAPA */
+
+.layer-item {
+    flex-wrap: wrap;
+}
+
+.layer-noise-list {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.noise-entry {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+
+    padding: 6px;
+    background: #3a3a3a;
+    border: 1px solid #666;
+    font-size: 11px;
+}
+
+.noise-entry input[type="color"] {
+    width: 28px;
+    height: 20px;
+    padding: 0;
+    border: 1px solid #777;
+    background: transparent;
+    cursor: pointer;
+}
+
+.noise-entry label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.noise-blend-select {
+    flex: 1 1 100px;
+    min-width: 90px;
+    font-size: 11px;
+    background: #2c2c2c;
+    color: white;
+    border: 1px solid #777;
+}
+
+.noise-entry .noise-seed-input {
+    width: 64px;
+    font-size: 11px;
+    background: #2c2c2c;
+    color: white;
+    border: 1px solid #777;
+}
+
+.noise-entry .noise-seed-btn {
+    padding: 0 3px;
+    font-size: 11px;
+    background: #2c2c2c;
+    border: 1px solid #777;
+    cursor: pointer;
+}
+
+.noise-entry input[type="range"] {
+    width: 60px;
+}
+
+.noise-entry output {
+    min-width: 26px;
+    text-align: right;
+}
+
+.noise-entry .noise-remove-btn {
+    margin-left: auto;
+    background: #703030;
+    color: white;
+    border: 1px solid #944;
+    cursor: pointer;
+    width: 20px;
+    height: 20px;
+    line-height: 1;
+}
+
+.add-noise-btn {
+    width: 100%;
+    background: #3d5c3d;
+    border: 1px solid #5a8a5a;
+    color: white;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 4px;
+}
+
+.add-noise-btn:hover {
+    background: #4a704a;
+}
+
+
 /* COLORES */
 
 .terrain-color {
@@ -259,28 +359,24 @@ body {
 }
 
 
-.terrain-color.llanura {
-    background: #8fbc6b;
+.terrain-color.carretera {
+    background: #8b7355;
 }
 
-.terrain-color.bosque {
-    background: #27632a;
+.terrain-color.tren {
+    background: repeating-linear-gradient(90deg, #3a3a3a 0 2px, #bbb 2px 5px);
 }
 
-.terrain-color.montana {
-    background: #777;
-}
-
-.terrain-color.agua {
+.terrain-color.rio {
     background: #3d82b8;
 }
 
-.terrain-color.desierto {
-    background: #d7bd72;
+.terrain-color.ciudad {
+    background: linear-gradient(90deg, #b0604a 50%, #7f5040 50%);
 }
 
-.terrain-color.carretera {
-    background: #8b7355;
+.terrain-color.pueblo {
+    background: #c9a27a;
 }
 
 
@@ -458,4 +554,103 @@ body {
     #info-panel {
         max-height: 18dvh;
     }
+}
+
+/* FILA TERRENO BASE + SELECTOR DE COLOR */
+.terrain-type-row {
+    display: flex;
+    align-items: stretch;
+    gap: 6px;
+}
+
+.terrain-type-row .terrain-type {
+    flex: 1;
+}
+
+.terrain-type-row input[type="color"] {
+    width: 44px;
+    padding: 0;
+    border: 1px solid #777;
+    background: transparent;
+    cursor: pointer;
+}
+
+/* OPACIDAD DE CAPA */
+.layer-opacity {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+}
+
+.layer-opacity input[type="range"] {
+    flex: 1;
+}
+
+.layer-opacity output {
+    min-width: 30px;
+    text-align: right;
+}
+
+/* AJUSTES DEL RIO */
+.line-settings {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px;
+    padding: 8px;
+    background: #3a3a3a;
+    border: 1px solid #666;
+    font-size: 12px;
+}
+
+.line-settings[hidden],
+.line-settings [hidden] {
+    display: none;
+}
+
+.line-settings label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.line-settings input[type="range"] {
+    flex: 1;
+    min-width: 0;
+}
+
+.line-settings input[type="color"] {
+    width: 44px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid #777;
+    background: transparent;
+    cursor: pointer;
+}
+
+.line-settings output {
+    min-width: 30px;
+    text-align: right;
+}
+
+.line-settings button {
+    background: #555;
+    color: white;
+    border: 1px solid #777;
+    cursor: pointer;
+    padding: 4px;
+}
+
+.line-hint {
+    margin: 0;
+    font-size: 11px;
+    color: #aaa;
+}
+
+.line-shadow-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
 }

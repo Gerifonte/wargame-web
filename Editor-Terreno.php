@@ -64,26 +64,56 @@
             <div class="terrain-panel">
                 <h3>Tipos de Terrenos</h3>
                 <div class="terrain-types">
-                    <button class="terrain-type selected" data-terrain="llanura">
-                        <span class="terrain-color llanura"></span> Llanura
-                    </button>
-                    <button class="terrain-type" data-terrain="bosque">
-                        <span class="terrain-color bosque"></span> Bosque
-                    </button>
-                    <button class="terrain-type" data-terrain="montana">
-                        <span class="terrain-color montana"></span> Montaña
-                    </button>
-                    <button class="terrain-type" data-terrain="agua">
-                        <span class="terrain-color agua"></span> Agua
-                    </button>
-                    <button class="terrain-type" data-terrain="desierto">
-                        <span class="terrain-color desierto"></span> Desierto
-                    </button>
+                    <div class="terrain-type-row">
+                        <button class="terrain-type selected" data-terrain="base">
+                            <span class="terrain-color" id="baseTerrainSwatch" style="background:#8fbc6b"></span> Terreno base
+                        </button>
+                        <input type="color" id="baseTerrainColor" value="#8fbc6b" title="Color del terreno base">
+                    </div>
                     <button class="terrain-type" data-terrain="carretera">
                         <span class="terrain-color carretera"></span> Carretera
                     </button>
+                    <button class="terrain-type" data-terrain="tren">
+                        <span class="terrain-color tren"></span> Tren
+                    </button>
+                    <button class="terrain-type" data-terrain="rio">
+                        <span class="terrain-color rio"></span> Río
+                    </button>
+                    <button class="terrain-type" data-terrain="ciudad">
+                        <span class="terrain-color ciudad"></span> Ciudad
+                    </button>
+                    <button class="terrain-type" data-terrain="pueblo">
+                        <span class="terrain-color pueblo"></span> Pueblo
+                    </button>
                 </div>
 
+                <!-- AJUSTES DE TRAZO (visibles con los pinceles Rio, Carretera y Tren) -->
+                <div id="line-settings" class="line-settings" hidden>
+                    <label>Color <input type="color" id="lineColor" value="#3d82b8"></label>
+                    <label>Ancho <input type="range" id="lineWidth" min="4" max="80" step="1" value="20"><output id="lineWidthValue">20</output></label>
+                    <label class="line-river-only">Ondulación <input type="range" id="lineWaviness" min="0" max="100" step="5" value="40"><output id="lineWavinessValue">40%</output></label>
+                    <label class="line-check line-river-only"><input type="checkbox" id="lineTaper" checked> Finalizar en punta</label>
+                    <div id="line-shadow-group" class="line-shadow-group" hidden>
+                        <label class="line-check"><input type="checkbox" id="lineShadow"> Sombra</label>
+                        <label class="line-check"><input type="checkbox" id="lineShadowCenital"> Cenital (sin dirección)</label>
+                        <label>Dirección <input type="range" id="lineShadowDirection" min="0" max="360" step="5" value="50"><output id="lineShadowDirectionValue">50°</output></label>
+                        <label>Desenfoque <input type="range" id="lineShadowBlur" min="0" max="10" step="0.5" value="3"><output id="lineShadowBlurValue">3</output></label>
+                        <label>Opacidad sombra <input type="range" id="lineShadowOpacity" min="0" max="100" step="5" value="40"><output id="lineShadowOpacityValue">40%</output></label>
+                    </div>
+                    <button type="button" id="lineUndo">Deshacer último trazo</button>
+                    <p class="line-hint">Clic izquierdo: añadir punto, arrastrar uno o insertar sobre un tramo<br>Clic en un punto: aparecen dos ✕ (rojo: quitar punto, gris: cancelar trazo)<br>Mayús + clic: quitar punto<br>Ctrl + clic derecho: finalizar<br>Clic derecho (arrastrar): mover la vista<br>Esc: cancelar</p>
+                </div>
+
+                <!-- AJUSTES DE CIUDAD (visibles con el pincel Ciudad) -->
+                <div id="city-settings" class="line-settings" hidden>
+                    <label>Densidad <input type="range" id="cityDensity" min="1" max="14" step="1" value="6"><output id="cityDensityValue">6</output></label>
+                    <label class="line-check"><input type="checkbox" id="cityShadow"> Sombra</label>
+                    <label class="line-check"><input type="checkbox" id="cityShadowCenital"> Cenital (sin dirección)</label>
+                    <label>Dirección <input type="range" id="cityShadowDirection" min="0" max="360" step="5" value="50"><output id="cityShadowDirectionValue">50°</output></label>
+                    <label>Desenfoque <input type="range" id="cityShadowBlur" min="0" max="10" step="0.5" value="3"><output id="cityShadowBlurValue">3</output></label>
+                    <label>Opacidad sombra <input type="range" id="cityShadowOpacity" min="0" max="100" step="5" value="40"><output id="cityShadowOpacityValue">40%</output></label>
+                    <p class="line-hint">Pinta hexágonos para colocar casas<br>Mayús + clic: borrar las casas del hexágono<br>La densidad se aplica a los hexágonos que pintes; la sombra, a todas las casas</p>
+                </div>
 
     <!-- === NUEVO PANEL DE CAPAS === -->
     <div class="layers-panel">
