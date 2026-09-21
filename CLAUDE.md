@@ -26,4 +26,4 @@ Editor de mapas hexagonales para wargames (TypeScript + PixiJS). El estado funci
 
 ## Trampas conocidas
 - Añadir un tipo de terreno implica tocar `TerrainType`, `TERRAIN_LABELS`, `colores`, el botón en `Editor-Terreno.php` y el swatch en el CSS. Si es un trazo, también `LineKind`, `lineSettings` y `getLineKind()`.
-- `.gitignore` termina con una línea suelta `/node_modules/gitgit push` (un `git push` pegado por error), por lo que `node_modules` probablemente no queda ignorado. No se ha corregido.
+- `node_modules/` ya figura en `.gitignore`, pero **hay unos 4.665 archivos suyos rastreados en git** de antes de que se corrigiera la regla. Ignorarlos no los quita del repositorio; hace falta `git rm -r --cached node_modules` (cambio grande, que se haga solo si se pide).
