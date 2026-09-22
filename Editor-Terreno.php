@@ -55,6 +55,7 @@
             </fieldset>
             <button id="createTerrain">Crear/Reiniciar Mapa</button>
             <button type="button" id="toggleGrid">Ocultar malla</button>
+            <button type="button" id="toggleSnapGrid">Activar imán</button>
         </div>
 
 
@@ -85,6 +86,25 @@
                     <button class="terrain-type" data-terrain="pueblo">
                         <span class="terrain-color pueblo"></span> Pueblo
                     </button>
+                    <button class="terrain-type" id="eraserToolButton" type="button">
+                        🧹 Borrador
+                    </button>
+                </div>
+
+                <!-- AJUSTES DE BORRADO (visibles con la herramienta Borrador) -->
+                <div id="eraser-settings" class="line-settings" hidden>
+                    <label>Forma
+                        <select id="eraserShape">
+                            <option value="circulo">Círculo</option>
+                            <option value="cuadrado">Cuadrado</option>
+                            <option value="diamante">Diamante</option>
+                            <option value="organico">Orgánico (borde irregular)</option>
+                            <option value="disperso">Disperso (manchitas sueltas)</option>
+                        </select>
+                    </label>
+                    <label>Radio <input type="range" id="eraserRadius" min="1" max="6" step="0.5" value="2"><output id="eraserRadiusValue">2</output></label>
+                    <label>Suavidad <input type="range" id="eraserSoftness" min="0" max="100" step="5" value="40"><output id="eraserSoftnessValue">40%</output></label>
+                    <p class="line-hint">Hexágonos: se limpian dentro del pincel (la suavidad difumina el borde)<br>Perfil libre y río/carretera: se recorta un hueco real con la forma del pincel, también por dentro de la mancha<br>Tren: se corta el trazo donde pase el pincel<br>Casas: se borran por hexágono<br>Orgánico/disperso: la suavidad controla lo irregular/repartido del borde<br>Clic izquierdo (arrastrar): borrar<br>Clic derecho (arrastrar): mover la vista</p>
                 </div>
 
                 <!-- AJUSTES DE TRAZO (visibles con los pinceles Rio, Carretera y Tren) -->
@@ -135,6 +155,15 @@
                 <!-- El lienzo de PIXI.js se insertará aquí -->
             </div>
             <div id="info-panel" class="terrain-panel">
+        <h3>Imagen de referencia</h3>
+        <button type="button" id="loadReferenceImage">Cargar imagen de referencia</button>
+        <input type="file" id="referenceImageInput" accept="image/*" hidden>
+        <div id="reference-image-settings" class="line-settings" hidden>
+            <label class="line-check"><input type="checkbox" id="referenceImageEditMode"> Mover / escalar imagen</label>
+            <label>Opacidad <input type="range" id="referenceImageOpacity" min="0" max="100" step="5" value="60"><output id="referenceImageOpacityValue">60%</output></label>
+            <button type="button" id="removeReferenceImage">Quitar imagen</button>
+            <p class="line-hint">Con "Mover / escalar imagen" activo: botón izquierdo para arrastrarla, rueda del ratón para hacer zoom (centrado en el cursor). El botón derecho sigue moviendo la vista del mapa.</p>
+        </div>
         <h3>Hexágono Seleccionado</h3>
         <div id="hex-info-content">
             <p>Haz clic en un hexágono para ver sus detalles.</p>

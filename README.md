@@ -12,6 +12,7 @@ Editor de mapas hexagonales para wargames, construido en TypeScript sobre PixiJS
 - Grid hexagonal configurable: columnas, filas y radio de hexágono (`cols`, `filas`, `radioHex`), reconstruible en caliente con "Crear/Reiniciar Mapa".
 - Coordenadas offset (`col`, `fila`) con posición en píxeles precalculada (`mapaHexes`).
 - Rejilla visual activable/desactivable (botón "Ocultar/Mostrar malla").
+- **Puntos imán** (`buildSnapPoints`, recalculados en `crearTablero`): un vértice, centro de arista y centro por cada hexágono, deduplicados entre hexágonos vecinos. Se ven como puntitos discretos y semitransparentes (no estorban) y sirven para enganchar los puntos de control de las curvas Bézier (río/carretera/tren y perfil libre): al añadir o arrastrar un punto, si cae cerca de uno de la rejilla (`snapToGrid`) se ajusta a él. Los tiradores de ancla no tienen imán. **Desactivados por defecto al abrir el editor**; botón independiente **"Activar/Desactivar imán"** que apaga o enciende a la vez los puntos y el enganche, sin afectar a la malla hexagonal.
 - Pan con el **botón derecho** arrastrando y zoom centrado en el cursor (rueda), con límites de escala 0.1x–3x.
 
 ### Pinceles (panel "Tipos de Terrenos")
@@ -23,6 +24,7 @@ Editor de mapas hexagonales para wargames, construido en TypeScript sobre PixiJS
 | **Río** | Trazo libre con contorno de ancho variable. |
 | **Ciudad** | Pinta hexágonos que se llenan de casas (ver "Ciudad"). |
 | **Pueblo** | Botón presente pero **sin implementar**. |
+| **Borrador** 🧹 | Herramienta aparte, no un tipo de terreno (ver "Borrador"). |
 
 ### Sistema de capas
 - Capa base obligatoria (no se puede ocultar ni borrar), inicializada completa con el color de terreno base.
@@ -36,18 +38,19 @@ Editor de mapas hexagonales para wargames, construido en TypeScript sobre PixiJS
    - `createGroupContours` (contorno exterior eliminando aristas compartidas) o `createConvexHull`.
    - Agrupación `stroke` (una mancha por arrastre) vs `contour` (una mancha por isla).
    - `drawBezierWavyContour`: contorno Bézier con ondulación sinusoidal; parámetros **Cobertura**, **Ondulaciones**, **Suavidad**.
-3. **Perfil libre** — el usuario coloca puntos y el trazo se cierra en un polígono relleno al pulsar cerca del punto inicial (`addFreeWavyPoint`).
+3. **Perfil libre** — el usuario coloca puntos (contorno con Bézier cúbicos entre ellos, `drawFreeWavyPath`/`getFreeWavyHandles`). Pulsar en el punto inicial cierra la **vista previa** (se ve como mancha rellena) pero no termina la edición: se puede seguir moviendo puntos y tiradores. Solo **Ctrl + clic derecho** finaliza el trazo de verdad (`finishFreeWavy`; con menos de 3 puntos cancela en vez de cerrar). Mismo sistema de edición que río/carretera/tren mientras se dibuja: seleccionar/arrastrar puntos, tiradores de ancla en el punto seleccionado (Alt rompe la simetría), Mayús + clic quita un punto y Esc cancela.
 
 ### Trazos libres: río, carretera y tren
-Curvas independientes de la rejilla (Catmull-Rom por los puntos marcados, `sampleLineSpline`), guardadas por capa en `TerrainLayer.lines` con su tipo (`LineKind`), color, ancho y semilla.
+Curvas independientes de la rejilla (Bézier cúbicos entre los puntos marcados, `sampleLineSpline`), guardadas por capa en `TerrainLayer.lines` con su tipo (`LineKind`), color, ancho y semilla.
 
 **Controles**
 - **Clic izquierdo**: añade un punto al final.
 - **Arrastrar un punto**: lo mueve. **Clic sobre un tramo**: inserta un punto ahí y se puede arrastrar sin soltar.
 - **Clic en un punto**: lo selecciona (amarillo) y muestra dos ✕: rojo quita el punto, gris cancela todo el trazo. **Mayús + clic** también quita el punto.
+- **Tiradores de ancla**: el punto seleccionado muestra sus dos tiradores Bézier (cuadrados azules) para ajustar la curva a mano. Por defecto son automáticos (dan la misma curva suave de siempre); al arrastrar uno se fija y el opuesto gira para mantener el punto "suave" (**Alt + arrastrar** rompe la simetría y deja un punto de esquina).
 - **Ctrl + clic derecho**: finaliza el trazo (con menos de 2 puntos lo cancela). El clic derecho normal sigue moviendo la vista.
 - **Esc**: cancela el trazo en curso. Botón **Deshacer último trazo**: quita el último trazo de la capa activa.
-- Mientras se dibuja hay vista previa semitransparente con la guía de la curva. Los puntos son editables solo hasta finalizar.
+- Mientras se dibuja hay vista previa semitransparente con la guía de la curva. Los puntos (y sus tiradores) son editables solo hasta finalizar.
 
 **Ajustes** (por tipo de trazo; afectan solo al trazo en curso, los ya finalizados conservan los suyos)
 - Color y ancho (4–80).
@@ -60,6 +63,22 @@ Curvas independientes de la rejilla (Catmull-Rom por los puntos marcados, `sampl
 - Con el pincel Ciudad se pintan hexágonos (clic o arrastrar); **Mayús + clic** borra las casas de un hexágono. Las casas se guardan por capa (`TerrainLayer.cities`) y **no alteran el terreno de debajo**.
 - Cada hexágono genera casas deterministas (semilla por capa y casilla): vistas desde arriba, tejado a dos aguas con dos tonos, contorno fino, paleta de tejas rojizas/marrones/crema y algunas azul grisáceo. Tamaño y giro variables; la mayoría sigue la orientación de la "manzana" y algunas giran 90°. No se solapan dentro del mismo hexágono.
 - **Densidad** (1–14 casas por hexágono, 6 por defecto): se aplica a los hexágonos que se pinten a partir de ese momento.
+
+### Borrador
+Herramienta aparte (botón "🧹 Borrador"), no un tipo de terreno: no pinta ningún color y no aparece en `TerrainType`. Al activarla se recuerda el pincel que estaba seleccionado y se restaura solo al apagarla. Actúa sobre la **capa activa**; clic izquierdo y arrastrar para borrar, clic derecho sigue moviendo la vista (`eraseAt`). Contorno del pincel visible bajo el cursor (`drawEraserCursor`) para ver el radio (y, en círculo/cuadrado/diamante, la banda de suavidad) antes de pulsar. Todo lo que se puede recortar (hexágonos, perfil libre, río/carretera, perfil ondulado) usa la misma técnica de **hueco geométrico real**: se renderiza la forma junto al hueco (en `blendMode.ERASE`) en un `RenderTexture` propio y aislado (`renderIsolatedWithErase`, resolución ×3 y filtrado suave para que el borde no se vea "de píxeles"; con una forma muy grande la resolución baja para no pedirle a la GPU una textura más grande de lo que admite, y si algo falla se muestra la forma sin recortar en vez de romper el repintado). `Graphics.beginHole`/`endHole` se probó primero pero daba bordes rotos con curvas Bézier.
+- **Suavidad = borde difuminado de verdad** en círculo/cuadrado/diamante (`drawErasedFill`): varios anillos concéntricos con opacidad parcial, que al superponerse (blendMode ERASE reduce opacidad de forma multiplicativa, no es un corte binario) dan un degradado real, más "mordido" cerca del centro. En orgánico/disperso la suavidad no difumina un borde: controla lo irregular/repartido de su propia forma.
+- **Hexágonos**: mismo criterio que perfil libre, no un borrado de todo o nada. Los datos del hexágono solo se vacían del todo (dejan de contar para perfil ondulado, capas visibles, etc.) cuando el pincel lo cubre **entero** (sus 6 vértices); si solo toca el centro pero no llega a cubrirlo todo, se queda con un hueco visual (`HexData.erasedHoles`) y sus datos intactos. Con "solo tocar el centro" bastaba, arrastrar el pincel por una zona acababa vaciando casi todos los hexágonos del camino (el centro de cualquiera de ellos cae en el pincel en algún momento del arrastre) — por eso "seguía borrando hexágonos completos".
+- **Perfil libre y río/carretera** (son relleno): el hueco se guarda en el propio trazo (`erasedHoles`) sin tocar sus puntos de control, así que un trazo nuevo dibujado después no hereda huecos de otro ya borrado, y se puede vaciar también el interior de la mancha, no solo el borde.
+- **Perfil ondulado**: el contorno de un grupo de hexágonos se recalcula desde los datos de esos hexágonos en cada repintado, así que borrar (o simplemente no pintar) un hexágono en medio de una zona rodeada por el resto del grupo deja un agujero real, no solo en el borde. El contorno exacto por aristas (`createGroupContours`) distingue "borde exterior de una isla" de "borde de un agujero" por el sentido de giro del polígono (`signedArea`: fiable con formas cóncavas, a diferencia de mirar dónde cae el centro), y el agujero se recorta igual que perfil libre/río (`cutPolygonHoles`, sin suavidad: es un recorte exacto por hexágono, no de pincel). Aplica tanto a "Una mancha por arrastre" (envolvente convexa con los agujeros ya recortados) como a "Una mancha por grupo" (cada isla con su forma exacta).
+- **Tren** (railes, sin relleno que recortar): el trazo se corta en dos (o más) donde el pincel toque puntos en medio.
+- **Casas**: se borran por hexágono (como "Mayús + clic" en el pincel Ciudad).
+- **Ruido y sombras de río/carretera: de momento sin recorte real** (limitación conocida, no un bug pendiente de arreglar sin más):
+  - *Ruido*: su máscara (`noiseMaskWavy`) se acumula en un único `Graphics` compartido por capa; aplicarle huecos por trazo exigiría cambiar cómo se combinan varios trazos en una sola máscara (riesgo de romper algo que ya funciona).
+  - *Sombra de río/carretera*: todos los trazos de un tipo se acumulan en un único `Graphics` opaco antes de desenfocar (para que las sombras solapadas no sumen opacidad); añadir huecos ahí con la misma técnica que el relleno arriesgaba reintroducir ese problema.
+- **Tren** (railes, sin relleno que recortar): el trazo se corta en dos (o más) donde el pincel toque puntos en medio.
+- **Casas**: se borran por hexágono (como "Mayús + clic" en el pincel Ciudad), así que una zona solo borra las casas de los hexágonos que toque.
+- **Formas del pincel**: círculo, cuadrado, diamante (bordes limpios, la suavidad solo difumina el borrado de hexágonos) y dos formas irregulares — **orgánico** (contorno desigual tipo borde desgarrado) y **disperso** (varias manchitas sueltas) — donde la suavidad sí controla lo irregular/repartido del hueco. Cada hueco guarda su propia semilla y suavidad (`EraserStamp`) para no deformarse si luego se cambia el ajuste global.
+- **Ajustes**: forma, radio (1–6 radios de hexágono) y suavidad (0–100 %).
 
 ### Sombras (casas, carreteras y trenes)
 Ajustes: **Sombra** (activar, desactivada por defecto), **Dirección** (0°–360°; 0° = derecha, sentido horario, 50° por defecto), **Cenital** (sin desplazamiento, sombra ensanchada un 30 % alrededor; desactiva la dirección), **Desenfoque** gaussiano (0–10) y **Opacidad** (0–100 %).
@@ -76,6 +95,13 @@ Cada capa puede llevar su propia pila de capas de ruido estilo Photoshop (botón
 - Cada textura se reescala a su rango completo (0–1) antes de aplicar la fuerza, para que todos los tipos tengan el mismo contraste.
 - El ruido **solo se aplica a lo realmente pintado en esa capa** (máscaras `noiseMaskNormal` para hexágonos y `noiseMaskWavy` para manchas onduladas, trazo libre y trazos de río/carretera/tren) y respeta la opacidad de la capa.
 - **Los 27 modos de fusión de Photoshop** (`NOISE_BLEND_MODE_GROUPS`): 4 usan el blend nativo de la GPU (`NOISE_BLEND_NATIVE_GPU_MODE`) y los otros 23 un shader propio (`NOISE_BLEND_FRAGMENT_SHADER`) que captura lo pintado debajo (`captureNoiseBackdrop`).
+- **Presets de ruido**: cada entrada tiene botones 💾 (`exportNoisePreset`, pide un nombre y descarga sus ajustes como `.json` con ese nombre de archivo) y 📂 (`importNoisePreset`, carga un `.json` ya descargado y lo aplica a esa entrada). El preset guarda un nombre y el aspecto (tipo, semilla, colores, tamaño, octavas, estirado, fuerza, opacidad y modo de fusión) pero no `id` ni si está activada, que son de la instancia. Un archivo con datos inválidos o de otro origen se rechaza sin tocar nada.
+
+### Imagen de referencia
+Panel derecho (`#info-panel`), botón **"Cargar imagen de referencia"** (`loadReferenceImage`): abre un selector de archivo local y muestra la imagen centrada sobre el tablero, ajustada para caber dentro de él, en un contenedor propio (`referenceImageContainer`) que siempre queda por encima de todo (rejilla incluida) para poder calcarla.
+- **Opacidad** (0–100 %, 60 % por defecto) en vivo y botón **"Quitar imagen"**.
+- **Mover / escalar imagen** (checkbox): mientras está activo, el botón izquierdo arrastra la imagen y la rueda del ratón hace zoom centrado en el cursor (`zoomReferenceImageAt`), sin pintar ni mover el resto de herramientas; el botón derecho sigue moviendo la vista del mapa como siempre.
+- Al no estar dentro de una capa, no se guarda con el mapa (no hay persistencia, ver limitaciones) y se pierde al pulsar "Crear/Reiniciar Mapa".
 
 ### Renderizado
 - `dibujarTableroCompleto()` repinta base + capas + casas + overlay ondulado (manchas, trazo libre, sombras y trazos) + ruido + rejilla en cada cambio.

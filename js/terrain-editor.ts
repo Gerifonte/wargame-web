@@ -16,6 +16,36 @@ type WavySettings = {
 };
 type WavyGrouping = 'stroke' | 'contour';
 
+// Herramienta de borrado: pincel independiente del terreno (no es un TerrainType, no pinta ningún color).
+// Actúa sobre la capa activa:
+// - Hexágonos (color y perfil ondulado): se limpian de verdad (mutación de HexData), con difuminado de borde.
+// - Perfil libre y río/carretera (formas rellenas): se les recorta un HUECO geométrico real con la forma del
+//   pincel (ver buildErasableFill: render aislado + blendMode ERASE, no Graphics.beginHole/endHole, que con
+//   curvas Bézier daba resultados erráticos), así que se puede vaciar el interior de la mancha, no solo el borde.
+//   Los huecos se guardan en el propio trazo (EraserStamp[]) y se repintan cada vez: no tocan los puntos, así
+//   que un trazo nuevo dibujado después no hereda huecos de otro.
+// - Tren (railes, sin área que recortar): se separa en varios trazos donde el pincel corte por en medio.
+// - Casas: se borran por hexágono (como "Mayús + clic" en el pincel Ciudad).
+type EraserShape = 'circulo' | 'cuadrado' | 'diamante' | 'organico' | 'disperso';
+type EraserSettings = {
+    shape: EraserShape;
+    radius: number;
+    softness: number;
+};
+
+// Un "sello" del pincel de borrado ya aplicado a un trazo. seed fija la variante irregular (orgánico/disperso)
+// para que ese hueco concreto se vea igual en cada repintado, aunque cada pasada de borrado use una seed distinta.
+// softness va dentro del sello (no se lee del ajuste actual) para que cambiar el deslizador más tarde no
+// deforme huecos ya hechos.
+type EraserStamp = {
+    x: number;
+    y: number;
+    shape: EraserShape;
+    radius: number;
+    softness: number;
+    seed: number;
+};
+
 type NoiseBlendMode =
     | 'NORMAL' | 'DISSOLVE'
     | 'DARKEN' | 'MULTIPLY' | 'COLOR_BURN' | 'LINEAR_BURN' | 'DARKER_COLOR'
@@ -51,6 +81,24 @@ type NoiseLayerEntry = {
     blendMode: NoiseBlendMode;
 };
 
+// Preset exportable de una capa de ruido: solo el aspecto (id y enabled son de la instancia, no del preset).
+// Los colores se guardan como cadena hex para que el .json sea legible/editable a mano.
+type NoisePreset = {
+    name: string;
+    noiseType: NoiseType;
+    seed: number;
+    color1: string;
+    color2: string;
+    size: number;
+    octaves: number;
+    stretch: number;
+    strength: number;
+    opacity: number;
+    blendMode: NoiseBlendMode;
+};
+
+const NOISE_PRESET_FILE_MARKER = 'wargame-web-noise-preset';
+
 type HexCoordinate = {
     col: number;
     fila: number;
@@ -63,9 +111,17 @@ type Point = {
     y: number;
 };
 
+// Punto de control de un trazo (río/carretera/tren). Los tiradores son posiciones absolutas y opcionales:
+// si no están definidos, la curva usa una tangente automática (igual que antes de tener tiradores).
+type LinePoint = Point & {
+    handleIn?: Point;
+    handleOut?: Point;
+};
+
 type FreeWavyStroke = {
-    points: Point[];
+    points: LinePoint[];
     color: number;
+    erasedHoles?: EraserStamp[];
 };
 
 type LineSettings = {
@@ -109,8 +165,10 @@ const LINE_STEPS_PER_SEGMENT = 14;
 
 type LineEntry = LineSettings & {
     kind: LineKind;
-    points: Point[];
+    points: LinePoint[];
     seed: number;
+    // Solo tiene efecto visual en río/carretera (son relleno); en tren no se usa un hueco, se divide el trazo.
+    erasedHoles?: EraserStamp[];
 };
 
 type HexData = HexCoordinate & {
@@ -123,6 +181,9 @@ type HexData = HexCoordinate & {
     underlyingTerrain: TerrainType | null;
     underlyingColor: number | null;
     graphic: any;
+    // Recortes visuales del borrador que no llegan a vaciar el hexágono entero (el pincel solo lo toca en parte).
+    // Se limpia solo cuando el propio hexágono se vacía del todo (deja de tener sentido tener huecos si ya no hay nada).
+    erasedHoles?: EraserStamp[];
 };
 
 type TerrainLayer = {
@@ -336,6 +397,8 @@ class TerrainEditor {
     selectedHex: HexCoordinate | null;
     colores: Record<TerrainType, number>;
     selectedTerrain: TerrainType | null;
+    eraserMode: boolean;
+    eraserSettings: EraserSettings;
     infoPanelContent: HTMLElement;
     layerListElement: HTMLElement;
     coverageInput: HTMLInputElement;
@@ -348,6 +411,9 @@ class TerrainEditor {
     noiseTextureCache: Partial<Record<number, { key: string; texture: any }>>;
     noiseLayerCounter: number;
     pendingBackdropTextures: any[];
+    // RenderTexture de los trazos con huecos de borrador (buildErasableFill); se destruyen y recrean en cada
+    // dibujarTableroCompleto (ver el inicio de drawWavyTerrainGroups), igual que pendingBackdropTextures.
+    eraseHoleTextures: any[];
     paintGroupCounter: number;
     activePaintGroupId: number | null;
     layers: TerrainLayer[];
@@ -360,11 +426,31 @@ class TerrainEditor {
     gridContainer: any;
     gridVisible: boolean;
     mapaHexes: HexCoordinate[][];
-    freeWavyPoints: Point[];
+    // Puntos imán para las curvas Bézier: vértices, centros de arista y centro de cada hexágono. Se recalculan
+    // en crearTablero (cuando cambian cols/filas/radioHex). Contenedor propio: se activan/desactivan (vista y
+    // efecto de imán) independientemente de la malla hexagonal.
+    snapPoints: Point[];
+    snapPointsContainer: any;
+    snapGridEnabled: boolean;
+    // Imagen de referencia: siempre por encima de todo (se reordena igual que gridContainer/snapPointsContainer).
+    // Vive en coordenadas del viewport, así que el pan/zoom del mapa también la mueve; su propio pan/zoom
+    // (arrastrar y rueda con el modo activo) solo cambia la posición/escala del sprite dentro de ese contenedor.
+    referenceImageContainer: any;
+    referenceImageSprite: any | null;
+    referenceImageOpacity: number;
+    referenceImageEditMode: boolean;
+    // Contorno del pincel de borrado bajo el cursor (forma + radio + banda de suavidad). Se redibuja directo en
+    // pointermove, sin pasar por dibujarTableroCompleto(), para no repintar todo el tablero en cada mouseover.
+    eraserCursorContainer: any;
+    freeWavyPoints: LinePoint[];
+    freeWavyClosed: boolean;
+    selectedFreeWavyPointIndex: number | null;
+    draggedFreeWavyHandle: 'in' | 'out' | null;
     lineSettings: Record<LineKind, LineSettings>;
-    linePoints: Point[];
+    linePoints: LinePoint[];
     lineSeedCounter: number;
     selectedLinePointIndex: number | null;
+    draggedLineHandle: 'in' | 'out' | null;
     cityDensity: number;
     cityShadow: ShadowSettings;
     lineShadows: Record<'carretera' | 'tren', ShadowSettings>;
@@ -406,6 +492,8 @@ class TerrainEditor {
             pueblo: 0xc9a27a
         };
         this.selectedTerrain = 'base';
+        this.eraserMode = false;
+        this.eraserSettings = { shape: 'circulo', radius: 2, softness: 40 };
         this.infoPanelContent = infoPanelContent;
         this.layerListElement = layerListElement;
         this.coverageInput = coverageInput;
@@ -418,13 +506,22 @@ class TerrainEditor {
         this.noiseTextureCache = {};
         this.noiseLayerCounter = 0;
         this.pendingBackdropTextures = [];
+        this.eraseHoleTextures = [];
         this.paintGroupCounter = 0;
         this.activePaintGroupId = null;
         this.layers = [];
         this.activeLayer = null;
         this.layerCounter = 0;
         this.mapaHexes = [];
+        this.snapPoints = [];
+        this.snapGridEnabled = false;
+        this.referenceImageSprite = null;
+        this.referenceImageOpacity = 60;
+        this.referenceImageEditMode = false;
         this.freeWavyPoints = [];
+        this.freeWavyClosed = false;
+        this.selectedFreeWavyPointIndex = null;
+        this.draggedFreeWavyHandle = null;
         this.lineSettings = {
             rio: { color: this.colores.rio, width: 20, taper: true, waviness: 40 },
             carretera: { color: this.colores.carretera, width: 10, taper: false, waviness: 0 },
@@ -433,6 +530,7 @@ class TerrainEditor {
         this.linePoints = [];
         this.lineSeedCounter = 0;
         this.selectedLinePointIndex = null;
+        this.draggedLineHandle = null;
         this.cityDensity = 6;
         this.cityShadow = { enabled: false, direction: 50, cenital: false, blur: 3, opacity: 40 };
         this.lineShadows = {
@@ -467,7 +565,14 @@ class TerrainEditor {
 
         Object.keys(this.noiseTextureCache).forEach((id) => this.destroyNoiseTexture(Number(id)));
         this.layers = [];
+        // La imagen de referencia vivía en el viewport anterior (ya destruido): se olvida y hay que recargarla.
+        this.referenceImageSprite = null;
+        this.referenceImageEditMode = false;
+        document.getElementById('reference-image-settings')?.setAttribute('hidden', '');
         this.freeWavyPoints = [];
+        this.freeWavyClosed = false;
+        this.selectedFreeWavyPointIndex = null;
+        this.draggedFreeWavyHandle = null;
         this.linePoints = [];
         this.selectedLinePointIndex = null;
         this.mapaHexes = [];
@@ -476,6 +581,9 @@ class TerrainEditor {
         this.baseLayerContainer = new PIXI.Container();
         this.wavyOverlayContainer = new PIXI.Container();
         this.gridContainer = new PIXI.Container();
+        this.snapPointsContainer = new PIXI.Container();
+        this.referenceImageContainer = new PIXI.Container();
+        this.eraserCursorContainer = new PIXI.Container();
 
         for (let c = 0; c < this.cols; c++) {
             this.mapaHexes[c] = [];
@@ -485,27 +593,49 @@ class TerrainEditor {
                 this.mapaHexes[c][f] = { col: c, fila: f, x, y };
             }
         }
+        this.buildSnapPoints();
 
         this.viewport.addChild(this.baseLayerContainer);
         this.viewport.addChild(this.wavyOverlayContainer);
         this.viewport.addChild(this.gridContainer);
+        this.viewport.addChild(this.snapPointsContainer);
+        this.viewport.addChild(this.referenceImageContainer);
+        this.viewport.addChild(this.eraserCursorContainer);
         this.addLayer(true);
         this.viewport.x = 50;
         this.viewport.y = 50;
         this.updateLayerList();
     }
 
-    private drawHexGraphic(graphic: any, hexCoord: HexCoordinate, color: number, alpha: number, paintMode: PaintMode, borderColor: number, borderThickness: number): void {
+    // holes: recortes del borrador que no llegan a vaciar el hexágono entero (ver HexData.erasedHoles). En
+    // coordenadas de mundo, como todo EraserStamp; se trasladan a locales (relativas al centro del hexágono,
+    // igual que points) antes de recortarlos.
+    private drawHexGraphic(graphic: any, hexCoord: HexCoordinate, color: number, alpha: number, paintMode: PaintMode, borderColor: number, borderThickness: number, holes?: EraserStamp[]): void {
         graphic.clear();
+        graphic.removeChildren();
         graphic.lineStyle(borderThickness, borderColor);
 
         const points = paintMode === 'ondulado'
             ? this.createWavyHexPoints(hexCoord)
             : this.createRegularHexPoints();
+        const fillAlpha = paintMode === 'ondulado' ? alpha * 0.72 : alpha;
 
-        graphic.beginFill(color, paintMode === 'ondulado' ? alpha * 0.72 : alpha);
-        graphic.drawPolygon(points);
-        graphic.endFill();
+        if (holes && holes.length > 0) {
+            const localHoles = holes.map((hole) => ({ ...hole, x: hole.x - hexCoord.x, y: hole.y - hexCoord.y }));
+            const fillGraphic = new PIXI.Graphics();
+            fillGraphic.beginFill(color, fillAlpha);
+            fillGraphic.drawPolygon(points);
+            fillGraphic.endFill();
+            const pointsAsPoints: Point[] = [];
+            for (let i = 0; i < points.length; i += 2) pointsAsPoints.push({ x: points[i], y: points[i + 1] });
+            const bounds = this.computeBounds(pointsAsPoints, this.radioHex * 0.3);
+            const display = this.renderIsolatedWithErase(fillGraphic, bounds, (g) => localHoles.forEach((hole) => this.drawErasedFill(g, hole)));
+            graphic.addChild(display);
+        } else {
+            graphic.beginFill(color, fillAlpha);
+            graphic.drawPolygon(points);
+            graphic.endFill();
+        }
 
         graphic.x = hexCoord.x;
         graphic.y = hexCoord.y;
@@ -543,8 +673,92 @@ class TerrainEditor {
         return `${Math.round(point.x * 100)}:${Math.round(point.y * 100)}`;
     }
 
+    private polygonCentroid(points: Point[]): Point {
+        return {
+            x: points.reduce((sum, point) => sum + point.x, 0) / points.length,
+            y: points.reduce((sum, point) => sum + point.y, 0) / points.length
+        };
+    }
+
+    // Área con signo (fórmula del shoelace): el signo indica el sentido de giro del polígono. En un contorno
+    // trazado por aristas no compartidas (createGroupContours), el borde exterior de una isla y el borde de un
+    // agujero interior giran siempre en sentidos opuestos — es el criterio estándar (y fiable con formas
+    // cóncavas, a diferencia de mirar dónde cae el centro) para distinguir "sólido" de "hueco".
+    private signedArea(points: Point[]): number {
+        let sum = 0;
+        for (let i = 0; i < points.length; i++) {
+            const a = points[i];
+            const b = points[(i + 1) % points.length];
+            sum += a.x * b.y - b.x * a.y;
+        }
+        return sum;
+    }
+
+    // Ray casting habitual: sirve para decidir dentro de qué contorno "sólido" cae un agujero interior, una vez
+    // ya clasificados por signedArea.
+    private isPointInPolygon(point: Point, polygon: Point[]): boolean {
+        let inside = false;
+        for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+            const a = polygon[i];
+            const b = polygon[j];
+            const intersects = (a.y > point.y) !== (b.y > point.y)
+                && point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x;
+            if (intersects) inside = !inside;
+        }
+        return inside;
+    }
+
     private edgeKey(start: Point, end: Point): string {
         return [this.pointKey(start), this.pointKey(end)].sort().join('|');
+    }
+
+    // Puntos imán de toda la rejilla: vértice, centro de arista y centro de cada hexágono. Los vértices y aristas
+    // se comparten entre hexágonos vecinos, así que se deduplican por pointKey antes de guardarlos.
+    private buildSnapPoints(): void {
+        const localVertices = this.createRegularHexPoints();
+        const seen = new Map<string, Point>();
+        const addSnapPoint = (point: Point): void => {
+            const key = this.pointKey(point);
+            if (!seen.has(key)) seen.set(key, point);
+        };
+
+        for (let c = 0; c < this.cols; c++) {
+            for (let f = 0; f < this.filas; f++) {
+                const hex = this.mapaHexes[c][f];
+                addSnapPoint({ x: hex.x, y: hex.y });
+
+                const vertices: Point[] = [];
+                for (let i = 0; i < 6; i++) {
+                    const vertex = { x: hex.x + localVertices[i * 2], y: hex.y + localVertices[i * 2 + 1] };
+                    vertices.push(vertex);
+                    addSnapPoint(vertex);
+                }
+                for (let i = 0; i < 6; i++) {
+                    const a = vertices[i];
+                    const b = vertices[(i + 1) % 6];
+                    addSnapPoint({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+                }
+            }
+        }
+
+        this.snapPoints = Array.from(seen.values());
+    }
+
+    // Imán de los puntos de control de las curvas Bézier (río/carretera/tren y perfil libre): si la posición cae
+    // cerca de un punto de la rejilla (radio en píxeles de pantalla, independiente del zoom), se ajusta a él.
+    private snapToGrid(position: Point): Point {
+        if (!this.snapGridEnabled) return position;
+        const snapRadius = 12 / this.viewport.scale.x;
+        let closest: Point | null = null;
+        let closestDistance = snapRadius;
+        this.snapPoints.forEach((point) => {
+            const distance = Math.hypot(point.x - position.x, point.y - position.y);
+            if (distance <= closestDistance) {
+                closestDistance = distance;
+                closest = point;
+            }
+        });
+        return closest ?? position;
     }
 
     private createGroupContours(hexes: HexCoordinate[]): Point[][] {
@@ -831,6 +1045,11 @@ class TerrainEditor {
         return parseInt(hexString.replace('#', ''), 16);
     }
 
+    // Nombre de preset -> nombre de archivo válido: fuera los caracteres prohibidos en Windows/macOS/Linux.
+    private sanitizeFileName(name: string): string {
+        return name.replace(/[\\/:*?"<>|]+/g, '-').trim() || 'preset-ruido';
+    }
+
     private hashSeed(value: string): number {
         let hash = 0;
         for (let i = 0; i < value.length; i++) {
@@ -1027,6 +1246,89 @@ class TerrainEditor {
         return renderTexture;
     }
 
+    // Caja delimitadora de unos puntos, ampliada por margin (para saber cuánto RenderTexture hace falta).
+    private computeBounds(points: Point[], margin: number): { minX: number; minY: number; maxX: number; maxY: number } {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        points.forEach((point) => {
+            if (point.x < minX) minX = point.x;
+            if (point.x > maxX) maxX = point.x;
+            if (point.y < minY) minY = point.y;
+            if (point.y > maxY) maxY = point.y;
+        });
+        return { minX: minX - margin, minY: minY - margin, maxX: maxX + margin, maxY: maxY + margin };
+    }
+
+    // Recorta huecos "de verdad" (transparencia, no Graphics.beginHole/endHole: con curvas Bézier daba resultados
+    // erráticos) en fillGraphic: lo renderiza junto a lo que dibuje drawErase (en blendMode ERASE) en un
+    // RenderTexture propio y aislado (mismo truco que captureNoiseBackdrop), y devuelve un Sprite con el recorte
+    // ya hecho. drawErase null (sin nada que recortar) devuelve el propio fillGraphic sin tocar, sin coste extra.
+    private renderIsolatedWithErase(fillGraphic: any, bounds: { minX: number; minY: number; maxX: number; maxY: number }, drawErase: ((graphic: any) => void) | null): any {
+        if (!drawErase) return fillGraphic;
+
+        // Límite de tamaño de textura (WebGL suele tope en 4096–16384 según la GPU): con una mancha de perfil
+        // ondulado grande, el ancho/alto en píxeles de mundo puede superarlo con resolución ×3, y crear una
+        // RenderTexture más grande de lo que la GPU admite. Se limita el lado mayor y se ajusta la resolución
+        // (nunca por debajo de 1) para no pasarse.
+        const MAX_TEXTURE_SIDE = 4096;
+        const rawWidth = Math.max(1, bounds.maxX - bounds.minX);
+        const rawHeight = Math.max(1, bounds.maxY - bounds.minY);
+        // Sin suelo en 1: si la mancha es enorme, la resolución baja de 1 para no pedir una textura más grande
+        // de lo que la GPU admite (se ve algo más blanda, pero no revienta).
+        const resolution = Math.min(3, MAX_TEXTURE_SIDE / Math.max(rawWidth, rawHeight));
+        const width = Math.max(1, Math.ceil(rawWidth));
+        const height = Math.max(1, Math.ceil(rawHeight));
+
+        // drawErase gestiona sus propios beginFill/endFill (con la suavidad, cada anillo necesita su propia
+        // opacidad; ver drawEraserStampShape), no uno solo compartido para todo.
+        const eraseGraphic = new PIXI.Graphics();
+        drawErase(eraseGraphic);
+        eraseGraphic.blendMode = PIXI.BLEND_MODES.ERASE;
+
+        // Grupo aislado: el ERASE solo afecta a fillGraphic dentro de este RenderTexture, no a nada de la escena.
+        const group = new PIXI.Container();
+        group.x = -bounds.minX;
+        group.y = -bounds.minY;
+        group.addChild(fillGraphic, eraseGraphic);
+
+        // Red de seguridad: si algo falla al crear/renderizar la textura (p. ej. límites de la GPU en un caso
+        // no previsto), se devuelve la forma sin recortar en vez de romper todo el repintado del tablero.
+        try {
+            const renderTexture = PIXI.RenderTexture.create({ width, height, resolution });
+            renderTexture.baseTexture.scaleMode = PIXI.SCALE_MODES.LINEAR;
+            this.app.renderer.render(group, { renderTexture });
+            this.eraseHoleTextures.push(renderTexture);
+
+            const sprite = new PIXI.Sprite(renderTexture);
+            sprite.x = bounds.minX;
+            sprite.y = bounds.minY;
+            return sprite;
+        } catch (error) {
+            console.error('No se pudo recortar el hueco de borrado, se muestra la forma sin recortar.', error);
+            return fillGraphic;
+        }
+    }
+
+    // Huecos del pincel de borrado sobre un trazo (perfil libre o río/carretera): ver EraserStamp.
+    // extraMargin: además del margen fijo, cuánto puede sobresalir la forma de sus puntos (p. ej. el ancho de un río).
+    private buildErasableFill(fillGraphic: any, points: Point[], holes: EraserStamp[] | undefined, extraMargin: number): any {
+        if (!holes || holes.length === 0) return fillGraphic;
+        const maxHoleRadius = holes.reduce((max, hole) => Math.max(max, hole.radius), 0);
+        const bounds = this.computeBounds(points, this.radioHex * 2 + extraMargin + maxHoleRadius);
+        return this.renderIsolatedWithErase(fillGraphic, bounds, (graphic) => holes.forEach((hole) => this.drawErasedFill(graphic, hole)));
+    }
+
+    // Agujeros interiores de un contorno de perfil ondulado (hexágonos ausentes rodeados por el resto del grupo):
+    // se recortan como polígonos exactos (el propio contorno trazado del agujero), no como forma de pincel.
+    private cutPolygonHoles(fillGraphic: any, outer: Point[], holes: Point[][]): any {
+        if (holes.length === 0) return fillGraphic;
+        const bounds = this.computeBounds(outer, this.radioHex);
+        return this.renderIsolatedWithErase(fillGraphic, bounds, (graphic) => {
+            graphic.beginFill(0xffffff, 1);
+            holes.forEach((hole) => graphic.drawPolygon(hole.flatMap((point) => [point.x, point.y])));
+            graphic.endFill();
+        });
+    }
+
     private applyNoiseBlend(sprite: any, noise: NoiseLayerEntry): void {
         const nativeMode = NOISE_BLEND_NATIVE_GPU_MODE[noise.blendMode];
         if (nativeMode) {
@@ -1082,7 +1384,23 @@ class TerrainEditor {
         });
     }
 
-    private drawFreeWavyPath(graphic: any, points: Point[], closePath: boolean, color: number, alpha: number): void {
+    // Tiradores de un punto del perfil libre: al ser un contorno que siempre acaba cerrado, la tangente automática
+    // se calcula como un anillo (el vecino del último punto es el primero) incluso mientras aún se está dibujando,
+    // para que la vista previa ya anticipe la forma del cierre. Factor 0.18 (en vez del 1/6 de río/carretera/tren):
+    // es el que ya daba el aspecto orgánico de siempre, se conserva para no cambiar las manchas existentes.
+    private getFreeWavyHandles(points: LinePoint[], index: number): { in: Point; out: Point } {
+        const point = points[index];
+        const previous = points[(index - 1 + points.length) % points.length];
+        const next = points[(index + 1) % points.length];
+        const tangentX = (next.x - previous.x) * 0.18;
+        const tangentY = (next.y - previous.y) * 0.18;
+        return {
+            in: point.handleIn ?? { x: point.x - tangentX, y: point.y - tangentY },
+            out: point.handleOut ?? { x: point.x + tangentX, y: point.y + tangentY }
+        };
+    }
+
+    private drawFreeWavyPath(graphic: any, points: LinePoint[], closePath: boolean, color: number, alpha: number): void {
         if (points.length < 2) return;
 
         graphic.lineStyle(closePath ? 0 : 2, color, closePath ? 0 : 0.9);
@@ -1091,18 +1409,9 @@ class TerrainEditor {
 
         const segmentCount = closePath ? points.length : points.length - 1;
         for (let i = 0; i < segmentCount; i++) {
-            const current = points[i];
             const next = points[(i + 1) % points.length];
-            const previous = points[(i - 1 + points.length) % points.length];
-            const following = points[(i + 2) % points.length];
-            const controlOut = {
-                x: current.x + (next.x - previous.x) * 0.18,
-                y: current.y + (next.y - previous.y) * 0.18
-            };
-            const controlIn = {
-                x: next.x - (following.x - current.x) * 0.18,
-                y: next.y - (following.y - current.y) * 0.18
-            };
+            const controlOut = this.getFreeWavyHandles(points, i).out;
+            const controlIn = this.getFreeWavyHandles(points, (i + 1) % points.length).in;
             graphic.bezierCurveTo(controlOut.x, controlOut.y, controlIn.x, controlIn.y, next.x, next.y);
         }
 
@@ -1116,39 +1425,82 @@ class TerrainEditor {
         this.layers.forEach((layer) => layer.freeWavyStrokes.forEach((stroke) => {
             if (!layer.visible) return;
             const graphic = new PIXI.Graphics();
-            graphic.alpha = layer.opacity / 100;
             this.drawFreeWavyPath(graphic, stroke.points, true, stroke.color, 1);
+            const display = this.buildErasableFill(graphic, stroke.points, stroke.erasedHoles, 0);
+            display.alpha = layer.opacity / 100;
             if (layer.noiseLayers.some((noise) => noise.enabled)) {
                 layer.noiseMaskWavy = this.ensureNoiseMask(layer.noiseMaskWavy);
                 this.drawFreeWavyPath(layer.noiseMaskWavy, stroke.points, true, 0xffffff, 1);
             }
-            this.wavyOverlayContainer.addChild(graphic);
+            this.wavyOverlayContainer.addChild(display);
         }));
 
         if (this.freeWavyPoints.length > 0) {
             const preview = new PIXI.Graphics();
-            this.drawFreeWavyPath(preview, this.freeWavyPoints, false, 0xFFFFFF, 1);
+            // Cerrado (clic en el punto inicial) se previsualiza con el relleno del terreno; sin cerrar, solo el trazo blanco de siempre.
+            const previewColor = this.freeWavyClosed && this.selectedTerrain ? this.colores[this.selectedTerrain] : 0xFFFFFF;
+            this.drawFreeWavyPath(preview, this.freeWavyPoints, this.freeWavyClosed, previewColor, 0.6);
+
+            // Puntos de control y, para el seleccionado, sus tiradores (mismo estilo que río/carretera/tren).
+            preview.lineStyle(1, 0x000000, 0.8);
+            this.freeWavyPoints.forEach((point, index) => {
+                const isSelected = index === this.selectedFreeWavyPointIndex;
+                preview.beginFill(isSelected ? 0xffd54a : 0xffffff, 1);
+                preview.drawCircle(point.x, point.y, isSelected ? 5 : 4);
+                preview.endFill();
+            });
+
+            if (this.selectedFreeWavyPointIndex !== null) {
+                const index = this.selectedFreeWavyPointIndex;
+                const point = this.freeWavyPoints[index];
+                const handles = this.getFreeWavyHandles(this.freeWavyPoints, index);
+                [handles.out, handles.in].forEach((position) => {
+                    preview.lineStyle(1, 0x4fc3f7, 0.9);
+                    preview.moveTo(point.x, point.y);
+                    preview.lineTo(position.x, position.y);
+                    preview.lineStyle(1, 0x01579b, 1);
+                    preview.beginFill(0x4fc3f7, 1);
+                    preview.drawRect(position.x - 3.5, position.y - 3.5, 7, 7);
+                    preview.endFill();
+                });
+                preview.lineStyle(0);
+            }
+
             this.wavyOverlayContainer.addChild(preview);
         }
     }
 
-    // Curva Catmull-Rom que pasa por todos los puntos marcados con el ratón.
-    private sampleLineSpline(points: Point[]): Point[] {
+    // Tiradores de un punto de control: si el punto no tiene tirador propio (no se ha arrastrado nunca),
+    // se calcula uno automático a partir de los vecinos con la misma tangente que daba antes el Catmull-Rom
+    // (conversión estándar Catmull-Rom → Bézier, factor 1/6), así que una curva sin tocar se ve igual que antes.
+    private getPointHandles(points: LinePoint[], index: number): { in: Point; out: Point } {
+        const point = points[index];
+        const previous = points[Math.max(0, index - 1)];
+        const next = points[Math.min(points.length - 1, index + 1)];
+        const tangentX = (next.x - previous.x) / 6;
+        const tangentY = (next.y - previous.y) / 6;
+        return {
+            in: point.handleIn ?? { x: point.x - tangentX, y: point.y - tangentY },
+            out: point.handleOut ?? { x: point.x + tangentX, y: point.y + tangentY }
+        };
+    }
+
+    // Curva de Bézier cúbicos que pasa por todos los puntos de control, usando sus tiradores (propios o automáticos).
+    private sampleLineSpline(points: LinePoint[]): Point[] {
         const stepsPerSegment = LINE_STEPS_PER_SEGMENT;
         const result: Point[] = [];
 
         for (let i = 0; i < points.length - 1; i++) {
-            const p0 = points[Math.max(0, i - 1)];
             const p1 = points[i];
             const p2 = points[i + 1];
-            const p3 = points[Math.min(points.length - 1, i + 2)];
+            const h1 = this.getPointHandles(points, i).out;
+            const h2 = this.getPointHandles(points, i + 1).in;
             for (let step = 0; step < stepsPerSegment; step++) {
                 const t = step / stepsPerSegment;
-                const t2 = t * t;
-                const t3 = t2 * t;
+                const mt = 1 - t;
                 result.push({
-                    x: 0.5 * (2 * p1.x + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
-                    y: 0.5 * (2 * p1.y + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
+                    x: mt * mt * mt * p1.x + 3 * mt * mt * t * h1.x + 3 * mt * t * t * h2.x + t * t * t * p2.x,
+                    y: mt * mt * mt * p1.y + 3 * mt * mt * t * h1.y + 3 * mt * t * t * h2.y + t * t * t * p2.y
                 });
             }
         }
@@ -1327,7 +1679,9 @@ class TerrainEditor {
 
             const { offsetX, offsetY, growth } = this.getShadowVector(shadow);
             lines.forEach((line) => {
-                // La sombra es el propio trazo desplazado (y algo más ancho con luz cenital).
+                // La sombra es el propio trazo desplazado (y algo más ancho con luz cenital). No lleva los huecos
+                // del borrador (drawLineShape ya no los aplica; ver buildErasableFill): la sombra de un trazo
+                // borrado en parte se queda completa, imperfección menor aceptada por ahora.
                 this.drawLineShape(graphic, {
                     ...line,
                     width: line.width * growth,
@@ -1463,6 +1817,9 @@ class TerrainEditor {
     }
 
     // Dibuja la forma final de un trazo según su tipo, para reutilizarla en el dibujo, la vista previa y la máscara de ruido.
+    // Dibuja la forma final de un trazo según su tipo, para reutilizarla en el dibujo, la sombra y la máscara de
+    // ruido. Los huecos del borrador NO se aplican aquí (ver eraseAt/buildErasableFill): esta función dibuja
+    // dentro del Graphics que le pasen, y los huecos necesitan un render aislado propio por trazo.
     private drawLineShape(graphic: any, line: LineEntry, color: number, alpha: number): void {
         if (line.kind === 'tren') {
             this.drawRailway(graphic, line, color, alpha);
@@ -1484,9 +1841,10 @@ class TerrainEditor {
             this.drawLineShadows(layer);
             layer.lines.forEach((line) => {
                 const graphic = new PIXI.Graphics();
-                graphic.alpha = layer.opacity / 100;
                 this.drawLineShape(graphic, line, line.color, 1);
-                this.wavyOverlayContainer.addChild(graphic);
+                const display = this.buildErasableFill(graphic, line.points, line.erasedHoles, line.width);
+                display.alpha = layer.opacity / 100;
+                this.wavyOverlayContainer.addChild(display);
 
                 if (layer.noiseLayers.some((noise) => noise.enabled)) {
                     layer.noiseMaskWavy = this.ensureNoiseMask(layer.noiseMaskWavy);
@@ -1527,6 +1885,27 @@ class TerrainEditor {
             preview.endFill();
         });
 
+        // Tiradores de ancla (tipo Bézier) del punto seleccionado: línea guía + cuadrado arrastrable en cada extremo.
+        if (this.selectedLinePointIndex !== null) {
+            const index = this.selectedLinePointIndex;
+            const point = this.linePoints[index];
+            const handles = this.getPointHandles(this.linePoints, index);
+            const sides: { position: Point; visible: boolean }[] = [
+                { position: handles.out, visible: index < this.linePoints.length - 1 },
+                { position: handles.in, visible: index > 0 }
+            ];
+            sides.filter((side) => side.visible).forEach(({ position }) => {
+                preview.lineStyle(1, 0x4fc3f7, 0.9);
+                preview.moveTo(point.x, point.y);
+                preview.lineTo(position.x, position.y);
+                preview.lineStyle(1, 0x01579b, 1);
+                preview.beginFill(0x4fc3f7, 1);
+                preview.drawRect(position.x - 3.5, position.y - 3.5, 7, 7);
+                preview.endFill();
+            });
+            preview.lineStyle(0);
+        }
+
         const selectedPoint = this.selectedLinePointIndex === null ? null : this.linePoints[this.selectedLinePointIndex];
         if (selectedPoint) {
             const icons = this.getLineIconPositions(selectedPoint);
@@ -1556,6 +1935,18 @@ class TerrainEditor {
             removeLine: { x: point.x + 40 / scale, y: point.y - 16 / scale },
             radius: 9 / scale
         };
+    }
+
+    // Tirador ('in' o 'out') del punto seleccionado bajo el cursor. Los tiradores solo se muestran (y se pueden
+    // pulsar) para el punto seleccionado, igual que en los editores vectoriales habituales.
+    private findLineHandleAt(position: Point): 'in' | 'out' | null {
+        if (this.selectedLinePointIndex === null) return null;
+        const index = this.selectedLinePointIndex;
+        const hitRadius = 9 / this.viewport.scale.x;
+        const handles = this.getPointHandles(this.linePoints, index);
+        if (index < this.linePoints.length - 1 && Math.hypot(handles.out.x - position.x, handles.out.y - position.y) <= hitRadius) return 'out';
+        if (index > 0 && Math.hypot(handles.in.x - position.x, handles.in.y - position.y) <= hitRadius) return 'in';
+        return null;
     }
 
     // Índice del punto de control bajo el cursor (radio en píxeles de pantalla, independiente del zoom).
@@ -1598,29 +1989,63 @@ class TerrainEditor {
     }
 
     private insertLinePoint(index: number, position: Point): void {
-        this.linePoints.splice(index, 0, position);
+        this.linePoints.splice(index, 0, this.snapToGrid(position));
         this.dibujarTableroCompleto();
     }
 
-    private moveLinePoint(index: number, position: Point): void {
-        if (!this.linePoints[index]) return;
-        this.linePoints[index] = position;
+    private moveLinePoint(index: number, rawPosition: Point): void {
+        const point = this.linePoints[index];
+        if (!point) return;
+        const position = this.snapToGrid(rawPosition);
+        // Los tiradores propios se guardan en posición absoluta, así que se desplazan con el ancla para no perder su forma.
+        const dx = position.x - point.x;
+        const dy = position.y - point.y;
+        this.linePoints[index] = {
+            x: position.x,
+            y: position.y,
+            handleIn: point.handleIn ? { x: point.handleIn.x + dx, y: point.handleIn.y + dy } : undefined,
+            handleOut: point.handleOut ? { x: point.handleOut.x + dx, y: point.handleOut.y + dy } : undefined
+        };
+        this.dibujarTableroCompleto();
+    }
+
+    // Arrastra el tirador 'in' u 'out' del punto seleccionado. Por defecto el punto queda "suave": el tirador
+    // opuesto gira para seguir alineado (conserva su propia longitud), como el nodo suave típico de un editor
+    // vectorial. Con Alt se rompe la simetría y cada tirador se mueve de forma independiente ("punto de esquina").
+    private setLineHandle(index: number, which: 'in' | 'out', position: Point, breakSymmetry: boolean): void {
+        const point = this.linePoints[index];
+        if (!point) return;
+        const current = this.getPointHandles(this.linePoints, index);
+        const updated: LinePoint = { ...point };
+        if (which === 'out') updated.handleOut = position; else updated.handleIn = position;
+
+        if (!breakSymmetry) {
+            const opposite = which === 'out' ? current.in : current.out;
+            const oppositeLength = Math.hypot(opposite.x - point.x, opposite.y - point.y);
+            const angle = Math.atan2(position.y - point.y, position.x - point.x) + Math.PI;
+            const mirrored = { x: point.x + Math.cos(angle) * oppositeLength, y: point.y + Math.sin(angle) * oppositeLength };
+            if (which === 'out') updated.handleIn = mirrored; else updated.handleOut = mirrored;
+        }
+
+        this.linePoints[index] = updated;
         this.dibujarTableroCompleto();
     }
 
     private removeLinePoint(index: number): void {
         this.linePoints.splice(index, 1);
         this.selectedLinePointIndex = null;
+        this.draggedLineHandle = null;
         this.dibujarTableroCompleto();
     }
 
     private addLinePoint(point: Point): void {
-        this.linePoints.push(point);
+        this.linePoints.push(this.snapToGrid(point));
         this.dibujarTableroCompleto();
     }
 
     private cancelLine(): void {
         this.selectedLinePointIndex = null;
+        this.draggedLineHandle = null;
         if (this.linePoints.length === 0) return;
         this.linePoints = [];
         this.dibujarTableroCompleto();
@@ -1636,6 +2061,7 @@ class TerrainEditor {
         this.activeLayer.lines.push({ ...this.lineSettings[kind], kind, points: [...this.linePoints], seed: ++this.lineSeedCounter });
         this.linePoints = [];
         this.selectedLinePointIndex = null;
+        this.draggedLineHandle = null;
         this.dibujarTableroCompleto();
     }
 
@@ -1645,21 +2071,112 @@ class TerrainEditor {
         this.dibujarTableroCompleto();
     }
 
+    // Añade un punto al final.
     private addFreeWavyPoint(point: Point): void {
-        if (this.freeWavyPoints.length >= 3) {
-            const firstPoint = this.freeWavyPoints[0];
-            if (Math.hypot(point.x - firstPoint.x, point.y - firstPoint.y) <= this.radioHex * 0.55) {
-                const terrain = this.selectedTerrain;
-                if (terrain && this.activeLayer) {
-                    this.activeLayer.freeWavyStrokes.push({ points: [...this.freeWavyPoints], color: this.colores[terrain] });
-                }
-                this.freeWavyPoints = [];
-                this.dibujarTableroCompleto();
-                return;
+        this.selectedFreeWavyPointIndex = null;
+        this.freeWavyPoints.push(this.snapToGrid(point));
+        this.dibujarTableroCompleto();
+    }
+
+    // Cierra el perfil libre en curso como mancha rellena. Solo se llama desde Ctrl + clic derecho (finishFreeWavy),
+    // igual que río/carretera/tren: ya no se cierra automáticamente al pulsar cerca del punto inicial.
+    private closeFreeWavyStroke(): void {
+        const terrain = this.selectedTerrain;
+        if (terrain && this.activeLayer) {
+            this.activeLayer.freeWavyStrokes.push({ points: [...this.freeWavyPoints], color: this.colores[terrain] });
+        }
+        this.freeWavyPoints = [];
+        this.freeWavyClosed = false;
+        this.selectedFreeWavyPointIndex = null;
+        this.draggedFreeWavyHandle = null;
+        this.dibujarTableroCompleto();
+    }
+
+    // Ctrl + clic derecho finaliza el perfil libre en curso, igual que en río/carretera/tren.
+    // Con menos de 3 puntos no forma polígono, así que se cancela en vez de cerrarse.
+    private finishFreeWavy(): void {
+        if (this.freeWavyPoints.length < 3) {
+            this.cancelFreeWavy();
+            return;
+        }
+        this.closeFreeWavyStroke();
+    }
+
+    private cancelFreeWavy(): void {
+        this.freeWavyClosed = false;
+        this.selectedFreeWavyPointIndex = null;
+        this.draggedFreeWavyHandle = null;
+        if (this.freeWavyPoints.length === 0) return;
+        this.freeWavyPoints = [];
+        this.dibujarTableroCompleto();
+    }
+
+    // Índice del punto del perfil libre bajo el cursor (mismo hit-test que los puntos de río/carretera/tren).
+    private findFreeWavyPointAt(position: Point): number | null {
+        const hitRadius = 9 / this.viewport.scale.x;
+        let closestIndex: number | null = null;
+        let closestDistance = hitRadius;
+        this.freeWavyPoints.forEach((point, index) => {
+            const distance = Math.hypot(point.x - position.x, point.y - position.y);
+            if (distance <= closestDistance) {
+                closestDistance = distance;
+                closestIndex = index;
             }
+        });
+        return closestIndex;
+    }
+
+    // Tirador ('in' o 'out') del punto seleccionado bajo el cursor.
+    private findFreeWavyHandleAt(position: Point): 'in' | 'out' | null {
+        if (this.selectedFreeWavyPointIndex === null) return null;
+        const index = this.selectedFreeWavyPointIndex;
+        const hitRadius = 9 / this.viewport.scale.x;
+        const handles = this.getFreeWavyHandles(this.freeWavyPoints, index);
+        if (Math.hypot(handles.out.x - position.x, handles.out.y - position.y) <= hitRadius) return 'out';
+        if (Math.hypot(handles.in.x - position.x, handles.in.y - position.y) <= hitRadius) return 'in';
+        return null;
+    }
+
+    private moveFreeWavyPoint(index: number, rawPosition: Point): void {
+        const point = this.freeWavyPoints[index];
+        if (!point) return;
+        const position = this.snapToGrid(rawPosition);
+        const dx = position.x - point.x;
+        const dy = position.y - point.y;
+        this.freeWavyPoints[index] = {
+            x: position.x,
+            y: position.y,
+            handleIn: point.handleIn ? { x: point.handleIn.x + dx, y: point.handleIn.y + dy } : undefined,
+            handleOut: point.handleOut ? { x: point.handleOut.x + dx, y: point.handleOut.y + dy } : undefined
+        };
+        this.dibujarTableroCompleto();
+    }
+
+    // Igual que setLineHandle: por defecto el punto queda "suave" (el tirador opuesto gira para seguir alineado);
+    // Alt + arrastrar rompe la simetría.
+    private setFreeWavyHandle(index: number, which: 'in' | 'out', position: Point, breakSymmetry: boolean): void {
+        const point = this.freeWavyPoints[index];
+        if (!point) return;
+        const current = this.getFreeWavyHandles(this.freeWavyPoints, index);
+        const updated: LinePoint = { ...point };
+        if (which === 'out') updated.handleOut = position; else updated.handleIn = position;
+
+        if (!breakSymmetry) {
+            const opposite = which === 'out' ? current.in : current.out;
+            const oppositeLength = Math.hypot(opposite.x - point.x, opposite.y - point.y);
+            const angle = Math.atan2(position.y - point.y, position.x - point.x) + Math.PI;
+            const mirrored = { x: point.x + Math.cos(angle) * oppositeLength, y: point.y + Math.sin(angle) * oppositeLength };
+            if (which === 'out') updated.handleIn = mirrored; else updated.handleOut = mirrored;
         }
 
-        this.freeWavyPoints.push(point);
+        this.freeWavyPoints[index] = updated;
+        this.dibujarTableroCompleto();
+    }
+
+    private removeFreeWavyPoint(index: number): void {
+        this.freeWavyPoints.splice(index, 1);
+        this.selectedFreeWavyPointIndex = null;
+        this.draggedFreeWavyHandle = null;
         this.dibujarTableroCompleto();
     }
 
@@ -1680,8 +2197,80 @@ class TerrainEditor {
         }
     }
 
+    // Puntos imán (this.snapPoints, calculados en buildSnapPoints): puntitos discretos, visibles pero sutiles,
+    // en un único Graphics para no crear cientos de objetos. Contenedor propio: se activan/desactivan con el
+    // botón "Activar/Desactivar imán", independiente de la malla hexagonal (snapGridEnabled).
+    private drawSnapPoints(): void {
+        this.snapPointsContainer.removeChildren();
+        if (!this.snapGridEnabled) return;
+
+        const graphic = new PIXI.Graphics();
+        graphic.beginFill(0xbfe3ff, 0.4);
+        this.snapPoints.forEach((point) => graphic.drawCircle(point.x, point.y, 1.6));
+        graphic.endFill();
+        this.snapPointsContainer.addChild(graphic);
+    }
+
+    // Imagen de referencia: se carga desde archivo local, centrada sobre el tablero y ajustada a su tamaño para
+    // partir de un encaje razonable. A partir de ahí, el pan/escala propios de la imagen (modo "Mover/escalar
+    // imagen") son cosa del usuario.
+    private loadReferenceImage(file: File): void {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const image = new Image();
+            image.onload = () => {
+                const texture = PIXI.Texture.from(image);
+                const sprite = new PIXI.Sprite(texture);
+                sprite.anchor.set(0.5);
+
+                const boardWidth = this.cols * this.radioHex * 1.5;
+                const boardHeight = this.filas * (Math.sqrt(3) * this.radioHex);
+                sprite.scale.set(Math.min(boardWidth / image.width, boardHeight / image.height) || 1);
+                sprite.x = boardWidth / 2;
+                sprite.y = boardHeight / 2;
+                sprite.alpha = this.referenceImageOpacity / 100;
+
+                // Si ya había una imagen cargada, se destruye (con su textura) antes de sustituirla.
+                this.referenceImageSprite?.destroy({ texture: true, baseTexture: true });
+                this.referenceImageContainer.removeChildren();
+                this.referenceImageContainer.addChild(sprite);
+                this.referenceImageSprite = sprite;
+                document.getElementById('reference-image-settings')?.removeAttribute('hidden');
+                this.dibujarTableroCompleto();
+            };
+            image.src = reader.result as string;
+        };
+        reader.readAsDataURL(file);
+    }
+
+    private removeReferenceImage(): void {
+        this.referenceImageSprite?.destroy({ texture: true, baseTexture: true });
+        this.referenceImageContainer.removeChildren();
+        this.referenceImageSprite = null;
+        this.referenceImageEditMode = false;
+        document.getElementById('reference-image-settings')?.setAttribute('hidden', '');
+        this.dibujarTableroCompleto();
+    }
+
+    // Zoom de la imagen de referencia centrado en el cursor (mismo criterio que el zoom del mapa): se ajusta la
+    // posición del sprite para que el punto bajo el cursor no se desplace al cambiar de escala.
+    private zoomReferenceImageAt(clientX: number, clientY: number, factor: number): void {
+        const sprite = this.referenceImageSprite;
+        if (!sprite) return;
+        const localPosition = this.viewport.toLocal({ x: clientX, y: clientY });
+        const relativeX = (localPosition.x - sprite.x) / sprite.scale.x;
+        const relativeY = (localPosition.y - sprite.y) / sprite.scale.y;
+        const newScale = Math.min(Math.max(sprite.scale.x * factor, 0.02), 20);
+        sprite.scale.set(newScale);
+        sprite.x = localPosition.x - relativeX * newScale;
+        sprite.y = localPosition.y - relativeY * newScale;
+        this.dibujarTableroCompleto();
+    }
+
     private drawWavyTerrainGroups(): void {
         this.wavyOverlayContainer.removeChildren();
+        // La limpieza de eraseHoleTextures del repintado anterior se hace en dibujarTableroCompleto (antes del
+        // bucle de hexágonos), no aquí: esta función se llama después de renderHex, que también las usa.
         const groups = new Map<string, { color: number; terreno: TerrainType; layerIndex: number; hexes: HexCoordinate[]; settings: WavySettings; grouping: WavyGrouping }>();
 
         for (let c = 0; c < this.cols; c++) {
@@ -1711,43 +2300,53 @@ class TerrainEditor {
             const hasNoise = groupLayer.noiseLayers.some((noise) => noise.enabled);
             const groupCenterX = group.hexes.reduce((sum, hex) => sum + hex.x, 0) / group.hexes.length;
             const groupCenterY = group.hexes.reduce((sum, hex) => sum + hex.y, 0) / group.hexes.length;
-            const contours = group.grouping === 'contour'
-                ? this.createGroupContours(group.hexes).map((contour) => contour)
-                : [this.createConvexHull(group.hexes)];
             const groupOpacity = groupLayer.opacity / 100;
-            const graphic = group.grouping === 'stroke' ? new PIXI.Graphics() : null;
-            if (graphic) {
-                graphic.alpha = groupOpacity;
-                graphic.beginFill(group.color, 1);
-            }
-            contours.forEach((contour) => {
-                const contourGraphic = graphic ?? new PIXI.Graphics();
-                contourGraphic.alpha = groupOpacity;
-                if (!graphic) contourGraphic.beginFill(group.color, 1);
-                const contourCenterX = contour.reduce((sum, point) => sum + point.x, 0) / contour.length;
-                const contourCenterY = contour.reduce((sum, point) => sum + point.y, 0) / contour.length;
-                const centerX = group.grouping === 'contour' ? contourCenterX : groupCenterX;
-                const centerY = group.grouping === 'contour' ? contourCenterY : groupCenterY;
-                this.drawBezierWavyContour(contourGraphic, contour, centerX, centerY, group.settings.coverage, group.settings.waves, group.settings.smoothness);
+
+            // Contorno exacto por aristas (independiente del modo de agrupación): sirve para detectar agujeros
+            // interiores (hexágonos ausentes en medio de una zona rodeada por el resto del grupo). "Sólido" vs
+            // "hueco" se distingue por el sentido de giro (signedArea), no por dónde cae el centro: con formas
+            // cóncavas (islas en forma de L, por ejemplo) el centro puede caer fuera de la propia isla y
+            // confundirla con un agujero.
+            const traced = this.createGroupContours(group.hexes);
+            // Referencia de "sólido": el propio contorno de un hexágono suelto, calculado con esta misma función
+            // (no con createConvexHull, que es otro algoritmo y podría no compartir convenio de giro).
+            const solidSign = Math.sign(this.signedArea(this.createGroupContours([group.hexes[0]])[0]));
+            const holeLoops = traced.filter((loop) => Math.sign(this.signedArea(loop)) !== solidSign);
+
+            // 'stroke': una sola envolvente convexa para todo el grupo (aspecto redondeado de siempre).
+            // 'contour': cada isla sólida del grupo por separado, con su forma exacta.
+            const outerShapes = group.grouping === 'contour'
+                ? traced.filter((loop) => Math.sign(this.signedArea(loop)) === solidSign)
+                : [this.createConvexHull(group.hexes)];
+
+            outerShapes.forEach((outer) => {
+                const holes = holeLoops.filter((hole) => this.isPointInPolygon(this.polygonCentroid(hole), outer));
+                const outerCenter = this.polygonCentroid(outer);
+                const centerX = group.grouping === 'contour' ? outerCenter.x : groupCenterX;
+                const centerY = group.grouping === 'contour' ? outerCenter.y : groupCenterY;
+
+                const fillGraphic = new PIXI.Graphics();
+                fillGraphic.beginFill(group.color, 1);
+                this.drawBezierWavyContour(fillGraphic, outer, centerX, centerY, group.settings.coverage, group.settings.waves, group.settings.smoothness);
+                fillGraphic.endFill();
+                const display = this.cutPolygonHoles(fillGraphic, outer, holes);
+                display.alpha = groupOpacity;
+                this.wavyOverlayContainer.addChild(display);
+
                 if (hasNoise) {
+                    // La máscara de ruido no lleva los agujeros (mismo criterio que perfil libre/río: imperfección
+                    // menor aceptada, ver README) — el ruido puede asomar levemente en el hueco.
                     groupLayer.noiseMaskWavy = this.ensureNoiseMask(groupLayer.noiseMaskWavy);
                     groupLayer.noiseMaskWavy.beginFill(0xffffff, 1);
-                    this.drawBezierWavyContour(groupLayer.noiseMaskWavy, contour, centerX, centerY, group.settings.coverage, group.settings.waves, group.settings.smoothness);
+                    this.drawBezierWavyContour(groupLayer.noiseMaskWavy, outer, centerX, centerY, group.settings.coverage, group.settings.waves, group.settings.smoothness);
                     groupLayer.noiseMaskWavy.endFill();
                 }
-                if (!graphic) {
-                    contourGraphic.endFill();
-                    this.wavyOverlayContainer.addChild(contourGraphic);
-                }
             });
-            if (graphic) {
-                graphic.endFill();
-                this.wavyOverlayContainer.addChild(graphic);
-            }
         });
         this.drawFreeWavyStrokes();
         this.drawLines();
         this.drawGrid();
+        this.drawSnapPoints();
     }
 
     private renderHex(hexCoord: HexCoordinate): void {
@@ -1766,7 +2365,8 @@ class TerrainEditor {
             1,
             'normal',
             0,
-            0
+            0,
+            baseData.erasedHoles
         );
         const baseLayer = this.layers[0];
         if (backgroundTerreno && baseLayer.noiseLayers.some((noise) => noise.enabled)) {
@@ -1778,9 +2378,10 @@ class TerrainEditor {
             const layer = this.layers[layerIndex];
             const data = layer.hexes[hexCoord.col][hexCoord.fila];
             data.graphic.clear();
+            data.graphic.removeChildren();
             if (!layer.visible || !data.terreno || data.color === null || data.paintMode === 'ondulado') continue;
 
-            this.drawHexGraphic(data.graphic, hexCoord, data.color, 1, 'normal', 0, 0);
+            this.drawHexGraphic(data.graphic, hexCoord, data.color, 1, 'normal', 0, 0, data.erasedHoles);
             if (layer.noiseLayers.some((noise) => noise.enabled)) {
                 layer.noiseMaskNormal = this.ensureNoiseMask(layer.noiseMaskNormal);
                 this.addHexPolygonToNoiseMask(layer.noiseMaskNormal, hexCoord);
@@ -1790,6 +2391,10 @@ class TerrainEditor {
 
     dibujarTableroCompleto(): void {
         this.reorderLayerContainers();
+        // Texturas de huecos de borrado (renderIsolatedWithErase) del repintado anterior: se destruyen antes de
+        // que el bucle de hexágonos (más abajo) y drawWavyTerrainGroups puedan crear las nuevas de esta pasada.
+        this.eraseHoleTextures.forEach((texture) => texture.destroy(true));
+        this.eraseHoleTextures = [];
         this.layers.forEach((layer) => {
             layer.noiseMaskNormal?.clear();
             layer.noiseMaskWavy?.clear();
@@ -1807,6 +2412,14 @@ class TerrainEditor {
         this.viewport.removeChild(this.gridContainer);
         this.viewport.addChild(this.gridContainer);
         this.gridContainer.visible = this.gridVisible;
+        this.viewport.removeChild(this.snapPointsContainer);
+        this.viewport.addChild(this.snapPointsContainer);
+        this.snapPointsContainer.visible = this.snapGridEnabled;
+        // La imagen de referencia siempre queda por encima de todo (incluida la rejilla) para poder calcarla.
+        this.viewport.removeChild(this.referenceImageContainer);
+        this.viewport.addChild(this.referenceImageContainer);
+        this.viewport.removeChild(this.eraserCursorContainer);
+        this.viewport.addChild(this.eraserCursorContainer);
     }
 
     private reorderLayerContainers(): void {
@@ -1843,6 +2456,13 @@ class TerrainEditor {
             this.drawGrid();
         });
 
+        // Activa/desactiva a la vez los puntos imán y su efecto de enganche (snapToGrid), independiente de la malla.
+        document.getElementById('toggleSnapGrid')?.addEventListener('click', (event) => {
+            this.snapGridEnabled = !this.snapGridEnabled;
+            (event.currentTarget as HTMLButtonElement).textContent = this.snapGridEnabled ? 'Desactivar imán' : 'Activar imán';
+            this.drawSnapPoints();
+        });
+
         document.querySelectorAll<HTMLButtonElement>('.paint-mode-option').forEach((button) => {
             button.addEventListener('click', () => {
                 const mode = button.dataset.paintMode as PaintMode | undefined;
@@ -1855,10 +2475,14 @@ class TerrainEditor {
                 button.classList.add('selected');
                 this.paintMode = mode;
                 this.freeWavyPoints = [];
+                this.freeWavyClosed = false;
+                this.selectedFreeWavyPointIndex = null;
+                this.draggedFreeWavyHandle = null;
                 this.dibujarTableroCompleto();
             });
         });
 
+        const eraserSettingsPanel = document.getElementById('eraser-settings');
         const citySettingsPanel = document.getElementById('city-settings');
         const cityDensityInput = document.getElementById('cityDensity') as HTMLInputElement | null;
         const cityDensityOutput = document.getElementById('cityDensityValue');
@@ -1963,7 +2587,8 @@ class TerrainEditor {
             if (lineWavinessOutput) lineWavinessOutput.textContent = `${settings.waviness}%`;
         };
 
-        document.querySelectorAll<HTMLButtonElement>('.terrain-type').forEach((button) => {
+        // Selector "[data-terrain]" para no incluir el botón Borrador, que es una herramienta aparte (no pinta terreno).
+        document.querySelectorAll<HTMLButtonElement>('.terrain-type[data-terrain]').forEach((button) => {
             button.addEventListener('click', () => {
                 const terrain = button.dataset.terrain as TerrainType | undefined;
                 if (button.classList.contains('selected')) {
@@ -1974,12 +2599,59 @@ class TerrainEditor {
                     button.classList.add('selected');
                     this.selectedTerrain = terrain ?? null;
                 }
+                this.eraserMode = false;
+                eraserSettingsPanel?.setAttribute('hidden', '');
+                this.drawEraserCursor(null);
                 this.linePoints = [];
                 this.selectedLinePointIndex = null;
                 syncLineControls();
                 citySettingsPanel?.toggleAttribute('hidden', this.selectedTerrain !== 'ciudad');
                 this.dibujarTableroCompleto();
             });
+        });
+
+        // Borrador: herramienta aparte, no un tipo de terreno (comparte el estilo .terrain-type y la exclusión
+        // mutua de selección con los botones de arriba, pero no pinta ningún color). Recuerda qué pincel estaba
+        // activo para recuperarlo solo al apagarse, en vez de dejar sin pincel seleccionado.
+        const eraserToolButton = document.getElementById('eraserToolButton') as HTMLButtonElement | null;
+        let terrainBeforeEraser: TerrainType | null = null;
+        eraserToolButton?.addEventListener('click', () => {
+            this.eraserMode = !this.eraserMode;
+            document.querySelectorAll('.terrain-type.selected').forEach((el) => el.classList.remove('selected'));
+            eraserSettingsPanel?.toggleAttribute('hidden', !this.eraserMode);
+            if (this.eraserMode) {
+                terrainBeforeEraser = this.selectedTerrain;
+                eraserToolButton.classList.add('selected');
+                this.selectedTerrain = null;
+                this.linePoints = [];
+                this.selectedLinePointIndex = null;
+                syncLineControls();
+                citySettingsPanel?.setAttribute('hidden', '');
+            } else {
+                this.selectedTerrain = terrainBeforeEraser;
+                document.querySelector<HTMLButtonElement>(`.terrain-type[data-terrain="${terrainBeforeEraser}"]`)?.classList.add('selected');
+                syncLineControls();
+                citySettingsPanel?.toggleAttribute('hidden', this.selectedTerrain !== 'ciudad');
+                this.drawEraserCursor(null);
+            }
+            this.dibujarTableroCompleto();
+        });
+
+        const eraserShapeInput = document.getElementById('eraserShape') as HTMLSelectElement | null;
+        const eraserRadiusInput = document.getElementById('eraserRadius') as HTMLInputElement | null;
+        const eraserRadiusOutput = document.getElementById('eraserRadiusValue');
+        const eraserSoftnessInput = document.getElementById('eraserSoftness') as HTMLInputElement | null;
+        const eraserSoftnessOutput = document.getElementById('eraserSoftnessValue');
+        eraserShapeInput?.addEventListener('change', () => {
+            this.eraserSettings.shape = eraserShapeInput.value as EraserShape;
+        });
+        eraserRadiusInput?.addEventListener('input', () => {
+            this.eraserSettings.radius = Number(eraserRadiusInput.value);
+            if (eraserRadiusOutput) eraserRadiusOutput.textContent = eraserRadiusInput.value;
+        });
+        eraserSoftnessInput?.addEventListener('input', () => {
+            this.eraserSettings.softness = Number(eraserSoftnessInput.value);
+            if (eraserSoftnessOutput) eraserSoftnessOutput.textContent = `${eraserSoftnessInput.value}%`;
         });
 
         const updateLineSettings = (): void => {
@@ -2001,7 +2673,9 @@ class TerrainEditor {
         });
         document.getElementById('lineUndo')?.addEventListener('click', () => this.undoLastLine());
         window.addEventListener('keydown', (event: KeyboardEvent) => {
-            if (event.key === 'Escape') this.cancelLine();
+            if (event.key !== 'Escape') return;
+            this.cancelLine();
+            this.cancelFreeWavy();
         });
 
         const baseColorInput = document.getElementById('baseTerrainColor') as HTMLInputElement | null;
@@ -2016,22 +2690,77 @@ class TerrainEditor {
 
         document.getElementById('add-layer-btn')?.addEventListener('click', () => this.addLayer());
 
+        // Imagen de referencia: cargarla, quitarla, opacidad en vivo y el modo de mover/escalarla
+        // (pointerdown/pointermove/wheel más abajo).
+        const referenceImageInput = document.getElementById('referenceImageInput') as HTMLInputElement | null;
+        const referenceImageSettings = document.getElementById('reference-image-settings');
+        const referenceImageEditModeInput = document.getElementById('referenceImageEditMode') as HTMLInputElement | null;
+        const referenceImageOpacityInput = document.getElementById('referenceImageOpacity') as HTMLInputElement | null;
+        const referenceImageOpacityOutput = document.getElementById('referenceImageOpacityValue');
+
+        document.getElementById('loadReferenceImage')?.addEventListener('click', () => referenceImageInput?.click());
+        referenceImageInput?.addEventListener('change', () => {
+            const file = referenceImageInput.files?.[0];
+            if (file) this.loadReferenceImage(file);
+            referenceImageInput.value = '';
+        });
+        referenceImageEditModeInput?.addEventListener('change', () => {
+            this.referenceImageEditMode = referenceImageEditModeInput.checked;
+        });
+        referenceImageOpacityInput?.addEventListener('input', () => {
+            this.referenceImageOpacity = Number(referenceImageOpacityInput.value);
+            if (referenceImageOpacityOutput) referenceImageOpacityOutput.textContent = `${this.referenceImageOpacity}%`;
+            if (this.referenceImageSprite) {
+                this.referenceImageSprite.alpha = this.referenceImageOpacity / 100;
+                this.dibujarTableroCompleto();
+            }
+        });
+        document.getElementById('removeReferenceImage')?.addEventListener('click', () => {
+            this.removeReferenceImage();
+            if (referenceImageEditModeInput) referenceImageEditModeInput.checked = false;
+            referenceImageSettings?.setAttribute('hidden', '');
+        });
+
         this.app.stage.eventMode = 'static';
         this.app.stage.hitArea = this.app.screen;
 
         let isPanning = false;
         let panStart = { x: 0, y: 0 };
         let isPainting = false;
+        let isErasing = false;
         let draggedLinePointIndex: number | null = null;
+        let draggedFreeWavyPointIndex: number | null = null;
+        let referenceImageDragStart: Point | null = null;
         const stopPainting = (): void => {
             isPanning = false;
             isPainting = false;
+            isErasing = false;
             draggedLinePointIndex = null;
+            this.draggedLineHandle = null;
+            draggedFreeWavyPointIndex = null;
+            this.draggedFreeWavyHandle = null;
+            referenceImageDragStart = null;
             this.activePaintGroupId = null;
         };
 
         this.app.stage.on('pointerdown', (event: any) => {
             const localPosition = this.viewport.toLocal(event.global);
+
+            // Modo "mover/escalar imagen": el botón izquierdo la arrastra (rueda la escala, más abajo) y el resto
+            // de herramientas queda en pausa; el botón derecho sigue moviendo la vista como siempre.
+            if (this.referenceImageEditMode && this.referenceImageSprite && event.button === 0) {
+                referenceImageDragStart = { x: event.global.x, y: event.global.y };
+                return;
+            }
+
+            // Borrador: clic izquierdo (y arrastrar) borra; el resto de pinceles/curvas quedan en pausa mientras
+            // está activo. El botón derecho sigue moviendo la vista.
+            if (this.eraserMode && event.button === 0) {
+                isErasing = true;
+                this.eraseAt(localPosition.x, localPosition.y);
+                return;
+            }
+
             if (this.getLineKind()) {
                 // Río, carretera y tren: clic izquierdo añade punto (o arrastra uno existente; con Mayús lo elimina)
                 // y Ctrl + clic derecho finaliza. El clic derecho sin Ctrl sigue moviendo la vista.
@@ -2047,6 +2776,13 @@ class TerrainEditor {
                             this.cancelLine();
                             return;
                         }
+                    }
+
+                    // Tiradores del punto seleccionado: se comprueban antes que los anclas para poder arrastrarlos.
+                    const handle = this.findLineHandleAt(localPosition);
+                    if (handle) {
+                        this.draggedLineHandle = handle;
+                        return;
                     }
 
                     const pointIndex = this.findLinePointAt(localPosition);
@@ -2077,9 +2813,37 @@ class TerrainEditor {
                 }
             }
 
-            if (event.button === 0 && this.paintMode === 'ondulado-libre' && this.selectedTerrain !== 'ciudad') {
-                this.addFreeWavyPoint({ x: localPosition.x, y: localPosition.y });
-                return;
+            // Sin terreno seleccionado (p. ej. justo tras usar el Borrador) no se dibuja nada: si no, se podían
+            // crear puntos que, al finalizar, no se pintaban (closeFreeWavyStroke exige un terreno seleccionado).
+            if (this.paintMode === 'ondulado-libre' && this.selectedTerrain && this.selectedTerrain !== 'ciudad') {
+                // Perfil libre: mismo esquema que río/carretera/tren (seleccionar/arrastrar puntos y tiradores,
+                // Mayús quita un punto, Ctrl + clic derecho finaliza). Pinchar en el punto inicial cierra la
+                // vista previa (línea de cierre + relleno) pero NO finaliza el trazo: se puede seguir editando
+                // y solo Ctrl + clic derecho lo da por terminado.
+                if (event.button === 0) {
+                    const handle = this.findFreeWavyHandleAt(localPosition);
+                    if (handle) {
+                        this.draggedFreeWavyHandle = handle;
+                        return;
+                    }
+
+                    const pointIndex = this.findFreeWavyPointAt(localPosition);
+                    if (pointIndex === null) {
+                        this.addFreeWavyPoint({ x: localPosition.x, y: localPosition.y });
+                    } else if (event.shiftKey) {
+                        this.removeFreeWavyPoint(pointIndex);
+                    } else {
+                        if (pointIndex === 0) this.freeWavyClosed = true;
+                        this.selectedFreeWavyPointIndex = pointIndex;
+                        draggedFreeWavyPointIndex = pointIndex;
+                        this.dibujarTableroCompleto();
+                    }
+                    return;
+                }
+                if (event.button === 2 && event.ctrlKey && this.freeWavyPoints.length > 0) {
+                    this.finishFreeWavy();
+                    return;
+                }
             }
 
             if (event.button === 2) {
@@ -2093,12 +2857,34 @@ class TerrainEditor {
         });
 
         this.app.stage.on('pointermove', (event: any) => {
-            if (isPanning) {
+            if (this.eraserMode) this.drawEraserCursor(this.viewport.toLocal(event.global));
+
+            if (referenceImageDragStart !== null && this.referenceImageSprite) {
+                const dx = (event.global.x - referenceImageDragStart.x) / this.viewport.scale.x;
+                const dy = (event.global.y - referenceImageDragStart.y) / this.viewport.scale.y;
+                this.referenceImageSprite.x += dx;
+                this.referenceImageSprite.y += dy;
+                referenceImageDragStart = { x: event.global.x, y: event.global.y };
+                this.dibujarTableroCompleto();
+            } else if (isPanning) {
                 this.viewport.x = event.global.x - panStart.x;
                 this.viewport.y = event.global.y - panStart.y;
+            } else if (this.draggedLineHandle !== null && this.selectedLinePointIndex !== null) {
+                // Con Alt se rompe la simetría del tirador opuesto (punto de esquina en vez de suave).
+                const localPosition = this.viewport.toLocal(event.global);
+                this.setLineHandle(this.selectedLinePointIndex, this.draggedLineHandle, { x: localPosition.x, y: localPosition.y }, event.altKey);
             } else if (draggedLinePointIndex !== null) {
                 const localPosition = this.viewport.toLocal(event.global);
                 this.moveLinePoint(draggedLinePointIndex, { x: localPosition.x, y: localPosition.y });
+            } else if (this.draggedFreeWavyHandle !== null && this.selectedFreeWavyPointIndex !== null) {
+                const localPosition = this.viewport.toLocal(event.global);
+                this.setFreeWavyHandle(this.selectedFreeWavyPointIndex, this.draggedFreeWavyHandle, { x: localPosition.x, y: localPosition.y }, event.altKey);
+            } else if (draggedFreeWavyPointIndex !== null) {
+                const localPosition = this.viewport.toLocal(event.global);
+                this.moveFreeWavyPoint(draggedFreeWavyPointIndex, { x: localPosition.x, y: localPosition.y });
+            } else if (isErasing) {
+                const localPosition = this.viewport.toLocal(event.global);
+                this.eraseAt(localPosition.x, localPosition.y);
             } else if (isPainting) {
                 const localPosition = this.viewport.toLocal(event.global);
                 this.pintarHexagono(localPosition.x, localPosition.y, event.shiftKey);
@@ -2113,12 +2899,18 @@ class TerrainEditor {
         window.addEventListener('pointercancel', stopPainting);
         this.app.stage.on('pointerout', () => {
             isPainting = false;
+            isErasing = false;
             this.activePaintGroupId = null;
+            this.drawEraserCursor(null);
         });
 
         this.app.view.addEventListener('wheel', (event: WheelEvent) => {
             event.preventDefault();
             const zoom = event.deltaY < 0 ? 1.1 : 0.9;
+            if (this.referenceImageEditMode && this.referenceImageSprite) {
+                this.zoomReferenceImageAt(event.clientX, event.clientY, zoom);
+                return;
+            }
             const worldPosition = this.viewport.toLocal({ x: event.clientX, y: event.clientY });
             const newScale = Math.min(Math.max(this.viewport.scale.x * zoom, 0.1), 3);
             this.viewport.scale.set(newScale);
@@ -2237,6 +3029,82 @@ class TerrainEditor {
         delete this.noiseTextureCache[noiseId];
     }
 
+    // Descarga el aspecto de una capa de ruido como .json (id/enabled quedan fuera, son de la instancia).
+    // Pide un nombre para el preset: se guarda dentro del .json y también da nombre al archivo descargado.
+    private exportNoisePreset(noise: NoiseLayerEntry): void {
+        const defaultName = NOISE_TYPE_LABELS[noise.noiseType];
+        const typedName = prompt('Nombre del preset:', defaultName);
+        if (typedName === null) return; // cancelado
+        const name = typedName.trim() || defaultName;
+
+        const preset: NoisePreset = {
+            name,
+            noiseType: noise.noiseType,
+            seed: noise.seed,
+            color1: this.colorToHexString(noise.color1),
+            color2: this.colorToHexString(noise.color2),
+            size: noise.size,
+            octaves: noise.octaves,
+            stretch: noise.stretch,
+            strength: noise.strength,
+            opacity: noise.opacity,
+            blendMode: noise.blendMode
+        };
+        const json = JSON.stringify({ tipo: NOISE_PRESET_FILE_MARKER, version: 1, preset }, null, 2);
+        const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${this.sanitizeFileName(name)}.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+    }
+
+    // Lee un archivo de preset (el descargado por exportNoisePreset) y lo aplica a esta capa de ruido.
+    private importNoisePreset(noise: NoiseLayerEntry, file: File): void {
+        const reader = new FileReader();
+        reader.onload = () => {
+            try {
+                const data = JSON.parse(String(reader.result));
+                // Admite tanto el archivo completo (con "preset" dentro) como solo el objeto de ajustes.
+                this.applyNoisePreset(noise, data?.preset ?? data);
+            } catch {
+                alert('El archivo de preset no es válido.');
+            }
+        };
+        reader.readAsText(file);
+    }
+
+    // Copia campo a campo lo que venga en el preset (ignora lo que falte o no tenga el tipo esperado) y
+    // deja los valores numéricos dentro de los mismos límites que sus controles.
+    private applyNoisePreset(noise: NoiseLayerEntry, preset: any): void {
+        if (!preset || typeof preset !== 'object') {
+            alert('El archivo de preset no es válido.');
+            return;
+        }
+        const clamp = (value: unknown, min: number, max: number): number | null =>
+            typeof value === 'number' && Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : null;
+
+        if (typeof preset.noiseType === 'string' && preset.noiseType in NOISE_TYPE_LABELS) noise.noiseType = preset.noiseType;
+        const seed = clamp(preset.seed, 0, 999999);
+        if (seed !== null) noise.seed = Math.floor(seed);
+        if (typeof preset.color1 === 'string') noise.color1 = this.hexStringToColor(preset.color1);
+        if (typeof preset.color2 === 'string') noise.color2 = this.hexStringToColor(preset.color2);
+        const size = clamp(preset.size, 1, 10);
+        if (size !== null) noise.size = size;
+        const octaves = clamp(preset.octaves, 1, 6);
+        if (octaves !== null) noise.octaves = octaves;
+        const stretch = clamp(preset.stretch, 1, 8);
+        if (stretch !== null) noise.stretch = stretch;
+        const strength = clamp(preset.strength, 0, 100);
+        if (strength !== null) noise.strength = strength;
+        const opacity = clamp(preset.opacity, 0, 100);
+        if (opacity !== null) noise.opacity = opacity;
+        if (typeof preset.blendMode === 'string' && preset.blendMode in NOISE_BLEND_MODE_LABELS) noise.blendMode = preset.blendMode;
+
+        this.updateLayerList();
+        this.dibujarTableroCompleto();
+    }
+
     toggleLayerVisibility(layerId: number): void {
         const layer = this.layers.find((currentLayer) => currentLayer.id === layerId);
         if (!layer || this.isBaseLayer(layerId)) return;
@@ -2264,6 +3132,8 @@ class TerrainEditor {
             const layerName = document.createElement('span');
             layerName.className = 'layer-name';
             layerName.textContent = layer.name;
+            // La base no es renombrable (título aparte para no sugerir un doble clic que no hace nada).
+            layerName.title = isBaseLayer ? 'Capa base (no se puede renombrar)' : 'Doble clic para renombrar';
             listItem.appendChild(layerName);
 
             let visibilityButton: HTMLButtonElement | null = null;
@@ -2473,6 +3343,23 @@ class TerrainEditor {
                 });
             });
 
+            // Presets: descargar los ajustes de esta capa de ruido como .json, o cargar uno ya descargado.
+            const exportPresetButton = document.createElement('button');
+            exportPresetButton.type = 'button';
+            exportPresetButton.className = 'noise-preset-btn';
+            exportPresetButton.textContent = '💾';
+            exportPresetButton.title = 'Guardar preset (descarga un .json)';
+
+            const importPresetInput = document.createElement('input');
+            importPresetInput.type = 'file';
+            importPresetInput.accept = 'application/json';
+            importPresetInput.hidden = true;
+            const importPresetButton = document.createElement('button');
+            importPresetButton.type = 'button';
+            importPresetButton.className = 'noise-preset-btn';
+            importPresetButton.textContent = '📂';
+            importPresetButton.title = 'Cargar preset desde un .json';
+
             const removeButton = document.createElement('button');
             removeButton.type = 'button';
             removeButton.className = 'noise-remove-btn';
@@ -2490,6 +3377,9 @@ class TerrainEditor {
             row.appendChild(stretchLabel);
             row.appendChild(strengthLabel);
             row.appendChild(opacityLabel);
+            row.appendChild(exportPresetButton);
+            row.appendChild(importPresetButton);
+            row.appendChild(importPresetInput);
             row.appendChild(removeButton);
 
             enabledInput.addEventListener('change', () => {
@@ -2549,6 +3439,13 @@ class TerrainEditor {
                 this.dibujarTableroCompleto();
             });
             removeButton.addEventListener('click', () => this.removeNoiseLayer(layer.id, noise.id));
+            exportPresetButton.addEventListener('click', () => this.exportNoisePreset(noise));
+            importPresetButton.addEventListener('click', () => importPresetInput.click());
+            importPresetInput.addEventListener('change', () => {
+                const file = importPresetInput.files?.[0];
+                if (file) this.importNoisePreset(noise, file);
+                importPresetInput.value = '';
+            });
 
             section.appendChild(row);
         });
@@ -2561,6 +3458,234 @@ class TerrainEditor {
         section.appendChild(addButton);
 
         return section;
+    }
+
+    // ¿(px,py) cae dentro del pincel de borrado centrado en (cx,cy)? Geométrico, sin difuminado: se usa tal cual
+    // para decidir si un objeto entero (mancha, trazo, casa) queda dentro del pincel.
+    private isInsideEraserShape(px: number, py: number, cx: number, cy: number, shape: EraserShape, radius: number): boolean {
+        const dx = px - cx;
+        const dy = py - cy;
+        switch (shape) {
+            case 'cuadrado': return Math.max(Math.abs(dx), Math.abs(dy)) <= radius;
+            case 'diamante': return Math.abs(dx) + Math.abs(dy) <= radius;
+            default: return Math.hypot(dx, dy) <= radius;
+        }
+    }
+
+    // Dibuja (relleno) la silueta de un sello de borrado: para círculo/cuadrado/diamante es la forma limpia de
+    // siempre; "orgánico" reparte sus vértices con un desigual tipo borde desgarrado y "disperso" son varias
+    // manchitas sueltas en vez de una forma continua. Cuanto más alta la suavidad, más irregular/disperso el
+    // resultado (en círculo/cuadrado/diamante la suavidad no afecta a la forma, se queda limpia).
+    // Determinista por stamp.seed: el mismo hueco se repinta siempre igual; cada pasada de borrado usa una seed nueva.
+    private drawEraserStampShape(graphic: any, stamp: EraserStamp): void {
+        const { x, y, shape, radius, softness, seed } = stamp;
+        const rand = (salt: string): number => this.hashSeed(`erase:${seed}:${salt}`) / 4294967296;
+
+        if (shape === 'circulo') {
+            graphic.drawCircle(x, y, radius);
+            return;
+        }
+        if (shape === 'cuadrado') {
+            graphic.drawRect(x - radius, y - radius, radius * 2, radius * 2);
+            return;
+        }
+        if (shape === 'diamante') {
+            graphic.drawPolygon([x, y - radius, x + radius, y, x, y + radius, x - radius, y]);
+            return;
+        }
+        if (shape === 'organico') {
+            const sides = 12;
+            const wobbleAmount = 0.15 + (softness / 100) * 0.45;
+            const points: number[] = [];
+            for (let i = 0; i < sides; i++) {
+                const angle = (Math.PI * 2 * i) / sides;
+                const wobble = 1 + (rand(`w${i}`) * 2 - 1) * wobbleAmount;
+                points.push(x + Math.cos(angle) * radius * wobble, y + Math.sin(angle) * radius * wobble);
+            }
+            graphic.drawPolygon(points);
+            return;
+        }
+        // Disperso: varias manchitas sueltas dentro del radio; más suavidad = más manchitas y más repartidas.
+        const blobCount = 5 + Math.round((softness / 100) * 6);
+        const spread = 0.2 + (softness / 100) * 0.6;
+        for (let i = 0; i < blobCount; i++) {
+            const angle = rand(`a${i}`) * Math.PI * 2;
+            const distance = rand(`d${i}`) * radius * spread;
+            const blobRadius = radius * (0.2 + rand(`r${i}`) * 0.3);
+            graphic.drawCircle(x + Math.cos(angle) * distance, y + Math.sin(angle) * distance, blobRadius);
+        }
+    }
+
+    // Rellena (con su(s) propio(s) beginFill/endFill) el hueco de un sello de borrado, con difuminado real en
+    // círculo/cuadrado/diamante: en vez de un corte limpio, varios anillos concéntricos con opacidad parcial.
+    // blendMode ERASE reduce la opacidad de destino según la del propio hueco (no es un corte binario), así que
+    // superponer anillos parciales de fuera hacia dentro da un degradado (más "mordido" cuanto más al centro).
+    // Orgánico/disperso no usan anillos: su propia irregularidad ya es "la suavidad" (ver drawEraserStampShape).
+    private drawErasedFill(graphic: any, stamp: EraserStamp): void {
+        const { x, y, shape, radius, softness } = stamp;
+        if (shape !== 'circulo' && shape !== 'cuadrado' && shape !== 'diamante' || softness <= 0) {
+            graphic.beginFill(0xffffff, 1);
+            this.drawEraserStampShape(graphic, stamp);
+            graphic.endFill();
+            return;
+        }
+
+        const bandStart = radius * (1 - softness / 100);
+        const rings = 10;
+        for (let i = rings; i >= 1; i--) {
+            const ringRadius = bandStart + (radius - bandStart) * (i / rings);
+            graphic.beginFill(0xffffff, 1 / rings);
+            this.drawEraserStampShape(graphic, { ...stamp, radius: ringRadius });
+            graphic.endFill();
+        }
+        // Núcleo interior (hasta el principio de la banda de suavidad): borrado completo siempre.
+        graphic.beginFill(0xffffff, 1);
+        this.drawEraserStampShape(graphic, { ...stamp, radius: bandStart });
+        graphic.endFill();
+    }
+
+    // Contorno del pincel de borrado en (x,y), en coordenadas del viewport (mismas que localPosition). Con
+    // position null, o sin modo borrador activo, lo deja vacío. No pasa por dibujarTableroCompleto(): es barato
+    // y se llama en cada pointermove para poder ver el radio antes de pulsar. Seed fija (no la de cada borrado
+    // real) para que la vista previa no "tiemble" con formas orgánicas/dispersas mientras solo se mueve el ratón.
+    private drawEraserCursor(position: Point | null): void {
+        this.eraserCursorContainer.removeChildren();
+        if (!position || !this.eraserMode) return;
+
+        const { shape, radius, softness } = this.eraserSettings;
+        const worldRadius = radius * this.radioHex;
+        const stamp: EraserStamp = { x: position.x, y: position.y, shape, radius: worldRadius, softness, seed: 1 };
+
+        const graphic = new PIXI.Graphics();
+        graphic.lineStyle(1.5 / this.viewport.scale.x, 0xffffff, 0.9);
+        this.drawEraserStampShape(graphic, stamp);
+        // En círculo/cuadrado/diamante la suavidad no cambia el contorno exterior, solo difumina el borde hacia
+        // dentro (drawErasedFill): se marca aparte con un contorno interior más tenue, donde el borrado ya es 100% seguro.
+        if (softness > 0 && (shape === 'circulo' || shape === 'cuadrado' || shape === 'diamante')) {
+            graphic.lineStyle(1.5 / this.viewport.scale.x, 0xffffff, 0.35);
+            this.drawEraserStampShape(graphic, { ...stamp, radius: worldRadius * (1 - softness / 100) });
+        }
+        graphic.lineStyle(0);
+        this.eraserCursorContainer.addChild(graphic);
+    }
+
+    // Caja delimitadora de unos puntos, ampliada por margin: sirve para descartar rápido (sin mirar cada punto)
+    // los trazos que el pincel no puede llegar a tocar. Falsos positivos en las esquinas son inofensivos (un
+    // hueco que cae fuera del relleno no pinta nada).
+    private boundsOverlapBrush(points: Point[], cx: number, cy: number, margin: number): boolean {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        points.forEach((point) => {
+            if (point.x < minX) minX = point.x;
+            if (point.x > maxX) maxX = point.x;
+            if (point.y < minY) minY = point.y;
+            if (point.y > maxY) maxY = point.y;
+        });
+        return cx >= minX - margin && cx <= maxX + margin && cy >= minY - margin && cy <= maxY + margin;
+    }
+
+    // Borra en (x,y) sobre la capa activa: hexágonos (con suavizado de borde), y en perfil libre/río/carretera
+    // recorta un hueco real de la forma del pincel (puede vaciar el interior de la mancha, no solo el borde).
+    // Tren no tiene relleno que recortar: se separa en varios trazos donde el pincel corte por en medio.
+    // Las casas son por hexágono, así que ya se borran de una en una.
+    private eraseAt(x: number, y: number): void {
+        if (!this.activeLayer) return;
+        const layer = this.activeLayer;
+        const settings = this.eraserSettings;
+        const brushRadius = settings.radius * this.radioHex;
+        let changed = false;
+        // Un único sello para todo lo que toque este borrado (hexágonos, perfil libre, río/carretera).
+        const stamp: EraserStamp = { x, y, shape: settings.shape, radius: brushRadius, softness: settings.softness, seed: Math.floor(Math.random() * 1000000) };
+
+        // Hexágonos: igual que perfil libre, un hueco geométrico real (no un borrado de todo o nada). Si se
+        // vaciara ya con solo tocar el CENTRO, arrastrar el pincel por encima acaba vaciando casi todos los
+        // hexágonos por los que pasa (el centro de cualquier hexágono del camino cae en el pincel en algún
+        // momento del arrastre) — eso es lo que se veía como "sigue borrando hexágonos completos". Por eso solo
+        // se vacían los datos cuando el pincel cubre el hexágono ENTERO (sus 6 vértices), igual que una mancha de
+        // perfil libre solo desaparece del todo si el hueco cubre toda su forma. Si solo lo toca en parte, se
+        // queda con un hueco visual y sus datos intactos (sigue contando para perfil ondulado, capas, etc.).
+        const hexVertices = this.createRegularHexPoints();
+        const isHexFullyCovered = (hexCoordinate: HexCoordinate): boolean => {
+            for (let i = 0; i < hexVertices.length; i += 2) {
+                const vx = hexCoordinate.x + hexVertices[i];
+                const vy = hexCoordinate.y + hexVertices[i + 1];
+                if (!this.isInsideEraserShape(vx, vy, x, y, settings.shape, brushRadius)) return false;
+            }
+            return true;
+        };
+
+        const estimatedColumn = Math.round(x / (this.radioHex * 1.5));
+        const columnSpan = Math.ceil(brushRadius / (this.radioHex * 1.5)) + 1;
+        for (let c = Math.max(0, estimatedColumn - columnSpan); c <= Math.min(this.cols - 1, estimatedColumn + columnSpan); c++) {
+            for (let f = 0; f < this.filas; f++) {
+                const hexCoordinate = this.mapaHexes[c][f];
+                const hexData = layer.hexes[c][f];
+                if (hexData.terreno === null && hexData.color === null) continue;
+
+                if (isHexFullyCovered(hexCoordinate)) {
+                    hexData.terreno = null;
+                    hexData.color = null;
+                    hexData.paintMode = null;
+                    hexData.wavySettings = null;
+                    hexData.wavyGrouping = null;
+                    hexData.paintGroupId = null;
+                    hexData.underlyingTerrain = null;
+                    hexData.underlyingColor = null;
+                    hexData.erasedHoles = undefined;
+                    changed = true;
+                } else if (this.isInsideEraserShape(hexCoordinate.x, hexCoordinate.y, x, y, settings.shape, brushRadius + this.radioHex)) {
+                    hexData.erasedHoles = [...(hexData.erasedHoles ?? []), stamp];
+                    changed = true;
+                }
+            }
+        }
+
+        layer.cities.forEach((city, key) => {
+            const hexCoordinate = this.mapaHexes[city.col][city.fila];
+            if (!this.isInsideEraserShape(hexCoordinate.x, hexCoordinate.y, x, y, settings.shape, brushRadius)) return;
+            city.graphic?.destroy();
+            layer.cities.delete(key);
+            changed = true;
+        });
+
+        // Perfil libre: relleno, se le añade un hueco geométrico (no toca los puntos de control).
+        layer.freeWavyStrokes = layer.freeWavyStrokes.map((stroke) => {
+            if (!this.boundsOverlapBrush(stroke.points, x, y, brushRadius)) return stroke;
+            changed = true;
+            return { ...stroke, erasedHoles: [...(stroke.erasedHoles ?? []), stamp] };
+        });
+
+        // Río/carretera (relleno, igual que el perfil libre) y tren (railes: sin relleno que recortar, así que
+        // se corta el trazo en dos donde el pincel toque sus puntos en medio) en un único recorrido.
+        const remainingLines: LineEntry[] = [];
+        layer.lines.forEach((line) => {
+            if (!this.boundsOverlapBrush(line.points, x, y, brushRadius)) {
+                remainingLines.push(line);
+                return;
+            }
+            if (line.kind !== 'tren') {
+                changed = true;
+                remainingLines.push({ ...line, erasedHoles: [...(line.erasedHoles ?? []), stamp] });
+                return;
+            }
+            const touchedAny = line.points.some((point) => this.isInsideEraserShape(point.x, point.y, x, y, settings.shape, brushRadius));
+            if (!touchedAny) {
+                remainingLines.push(line);
+                return;
+            }
+            changed = true;
+            const runs: LinePoint[][] = [[]];
+            line.points.forEach((point) => {
+                if (this.isInsideEraserShape(point.x, point.y, x, y, settings.shape, brushRadius)) {
+                    if (runs[runs.length - 1].length > 0) runs.push([]);
+                } else {
+                    runs[runs.length - 1].push(point);
+                }
+            });
+            runs.filter((run) => run.length >= 2).forEach((run) => remainingLines.push({ ...line, points: run }));
+        });
+        layer.lines = remainingLines;
+
+        if (changed) this.dibujarTableroCompleto();
     }
 
     pintarHexagono(x: number, y: number, erase = false): void {
