@@ -46,6 +46,14 @@ type EraserStamp = {
     seed: number;
 };
 
+// Tope de sellos guardados por hexágono/trazo (ver appendErasedHole): un arrastre largo o repetido sobre la
+// misma zona (sobre todo sin llegar a vaciar del todo el hexágono/trazo) puede apilar cientos de sellos ahí, y
+// cada repintado los redibuja TODOS. Con suavidad, cada sello son varios anillos (hasta 11, ver drawErasedFill,
+// aplica a las 5 formas), así que sin tope la geometría acumulada puede reventar la memoria al triangular. Los
+// sellos más viejos casi no aportan ya (una zona muy erosionada apenas cambia con un mordisco más), así que
+// descartarlos es un recorte seguro.
+const MAX_ERASED_HOLES_PER_TARGET = 24;
+
 type NoiseBlendMode =
     | 'NORMAL' | 'DISSOLVE'
     | 'DARKEN' | 'MULTIPLY' | 'COLOR_BURN' | 'LINEAR_BURN' | 'DARKER_COLOR'
@@ -184,6 +192,12 @@ type HexData = HexCoordinate & {
     // Recortes visuales del borrador que no llegan a vaciar el hexágono entero (el pincel solo lo toca en parte).
     // Se limpia solo cuando el propio hexágono se vacía del todo (deja de tener sentido tener huecos si ya no hay nada).
     erasedHoles?: EraserStamp[];
+    // Último sello del borrador que vació el hexágono del todo. A diferencia de erasedHoles (que se descarta al
+    // vaciar), este se conserva para que, si el hexágono formaba parte de una mancha de perfil ondulado, el
+    // agujero interior que deja en el contorno se pueda difuminar con la forma/suavidad del pincel (ver
+    // drawWavyTerrainGroups/cutWavyHoles) en vez de quedar como un corte geométrico limpio. Se limpia al
+    // repintar el hexágono (pintarHexagono), para que un borrado antiguo no manche una mancha nueva.
+    lastEraseStamp?: EraserStamp;
 };
 
 type TerrainLayer = {
@@ -399,6 +413,13 @@ class TerrainEditor {
     selectedTerrain: TerrainType | null;
     eraserMode: boolean;
     eraserSettings: EraserSettings;
+    // Último punto donde eraseAt añadió sellos de verdad (null si no se ha borrado nada en el trazo actual).
+    // Sirve para espaciar los sellos (ver eraseAt): sin esto, arrastrar despacio dispara un eraseAt por cada
+    // pointermove y, si el pincel no llega a cubrir el hexágono entero (más fácil con orgánico/disperso, cuyo
+    // borde efectivo es menor que el radio nominal), el array de sellos del hexágono crece sin límite hasta
+    // reventar la memoria al triangular tantas formas superpuestas.
+    lastEraseX: number | null;
+    lastEraseY: number | null;
     infoPanelContent: HTMLElement;
     layerListElement: HTMLElement;
     coverageInput: HTMLInputElement;
@@ -494,6 +515,8 @@ class TerrainEditor {
         this.selectedTerrain = 'base';
         this.eraserMode = false;
         this.eraserSettings = { shape: 'circulo', radius: 2, softness: 40 };
+        this.lastEraseX = null;
+        this.lastEraseY = null;
         this.infoPanelContent = infoPanelContent;
         this.layerListElement = layerListElement;
         this.coverageInput = coverageInput;
@@ -1317,16 +1340,48 @@ class TerrainEditor {
         return this.renderIsolatedWithErase(fillGraphic, bounds, (graphic) => holes.forEach((hole) => this.drawErasedFill(graphic, hole)));
     }
 
-    // Agujeros interiores de un contorno de perfil ondulado (hexágonos ausentes rodeados por el resto del grupo):
-    // se recortan como polígonos exactos (el propio contorno trazado del agujero), no como forma de pincel.
-    private cutPolygonHoles(fillGraphic: any, outer: Point[], holes: Point[][]): any {
-        if (holes.length === 0) return fillGraphic;
+    // Agujeros de una mancha de perfil ondulado: junta dos cosas en el mismo recorte aislado (mismo criterio que
+    // el resto de herramientas de borrado, ver README "Perfil ondulado"):
+    // - holes: agujeros interiores del contorno (hexágonos ausentes rodeados por el resto del grupo), recortados
+    //   como polígono exacto (el propio contorno trazado del agujero) — no viene del pincel, así que no lleva difuminado.
+    // - stamps: sellos del pincel del borrador (EraserStamp) que hayan tocado la mancha, con su forma y suavidad
+    //   real (drawErasedFill), igual que hexágonos sueltos/perfil libre/río/carretera.
+    private cutWavyHoles(fillGraphic: any, outer: Point[], holes: Point[][], stamps: EraserStamp[]): any {
+        if (holes.length === 0 && stamps.length === 0) return fillGraphic;
         const bounds = this.computeBounds(outer, this.radioHex);
         return this.renderIsolatedWithErase(fillGraphic, bounds, (graphic) => {
-            graphic.beginFill(0xffffff, 1);
-            holes.forEach((hole) => graphic.drawPolygon(hole.flatMap((point) => [point.x, point.y])));
-            graphic.endFill();
+            if (holes.length > 0) {
+                graphic.beginFill(0xffffff, 1);
+                holes.forEach((hole) => graphic.drawPolygon(hole.flatMap((point) => [point.x, point.y])));
+                graphic.endFill();
+            }
+            stamps.forEach((stamp) => this.drawErasedFill(graphic, stamp));
         });
+    }
+
+    // Sellos del pincel de borrado relevantes para una mancha de perfil ondulado: los de sus hexágonos miembros
+    // que solo se tocaron en parte (erasedHoles, ya guardados pero hasta ahora sin efecto sobre la mancha) y los
+    // de hexágonos vecinos que el borrador vació del todo (lastEraseStamp), para que el agujero que dejan en el
+    // contorno no sea un corte limpio. Recorre el mismo rango de columnas que eraseAt (acotado por bounds) en vez
+    // de toda la rejilla.
+    private collectWavyEraseStamps(layer: TerrainLayer, memberHexes: HexCoordinate[], bounds: { minX: number; minY: number; maxX: number; maxY: number }): EraserStamp[] {
+        const stamps: EraserStamp[] = [];
+        const memberKeys = new Set(memberHexes.map((hex) => `${hex.col}:${hex.fila}`));
+        memberHexes.forEach((hex) => {
+            const hexData = layer.hexes[hex.col][hex.fila];
+            if (hexData.erasedHoles) stamps.push(...hexData.erasedHoles);
+        });
+
+        const estimatedColumn = Math.round(((bounds.minX + bounds.maxX) / 2) / (this.radioHex * 1.5));
+        const columnSpan = Math.ceil((bounds.maxX - bounds.minX) / 2 / (this.radioHex * 1.5)) + 1;
+        for (let c = Math.max(0, estimatedColumn - columnSpan); c <= Math.min(this.cols - 1, estimatedColumn + columnSpan); c++) {
+            for (let f = 0; f < this.filas; f++) {
+                if (memberKeys.has(`${c}:${f}`)) continue;
+                const hexData = layer.hexes[c][f];
+                if (hexData.lastEraseStamp) stamps.push(hexData.lastEraseStamp);
+            }
+        }
+        return stamps;
     }
 
     private applyNoiseBlend(sprite: any, noise: NoiseLayerEntry): void {
@@ -2329,7 +2384,9 @@ class TerrainEditor {
                 fillGraphic.beginFill(group.color, 1);
                 this.drawBezierWavyContour(fillGraphic, outer, centerX, centerY, group.settings.coverage, group.settings.waves, group.settings.smoothness);
                 fillGraphic.endFill();
-                const display = this.cutPolygonHoles(fillGraphic, outer, holes);
+                const bounds = this.computeBounds(outer, this.radioHex);
+                const stamps = this.collectWavyEraseStamps(groupLayer, group.hexes, bounds);
+                const display = this.cutWavyHoles(fillGraphic, outer, holes, stamps);
                 display.alpha = groupOpacity;
                 this.wavyOverlayContainer.addChild(display);
 
@@ -2741,6 +2798,8 @@ class TerrainEditor {
             this.draggedFreeWavyHandle = null;
             referenceImageDragStart = null;
             this.activePaintGroupId = null;
+            this.lastEraseX = null;
+            this.lastEraseY = null;
         };
 
         this.app.stage.on('pointerdown', (event: any) => {
@@ -2757,6 +2816,9 @@ class TerrainEditor {
             // está activo. El botón derecho sigue moviendo la vista.
             if (this.eraserMode && event.button === 0) {
                 isErasing = true;
+                // Trazo nuevo: sin punto anterior, así que el primer clic nunca queda descartado por el espaciado.
+                this.lastEraseX = null;
+                this.lastEraseY = null;
                 this.eraseAt(localPosition.x, localPosition.y);
                 return;
             }
@@ -3460,15 +3522,75 @@ class TerrainEditor {
         return section;
     }
 
-    // ¿(px,py) cae dentro del pincel de borrado centrado en (cx,cy)? Geométrico, sin difuminado: se usa tal cual
-    // para decidir si un objeto entero (mancha, trazo, casa) queda dentro del pincel.
-    private isInsideEraserShape(px: number, py: number, cx: number, cy: number, shape: EraserShape, radius: number): boolean {
-        const dx = px - cx;
-        const dy = py - cy;
-        switch (shape) {
+    // Contorno de un sello "orgánico" (bamboleo desigual tipo borde desgarrado): compartido entre el dibujo
+    // (drawEraserStampShape) y la comprobación de cobertura (isInsideEraserShape) para que nunca se desincronicen
+    // — si solo se dibujara con esta forma pero se comprobara la cobertura con un círculo llano, un hexágono se
+    // podría vaciar del todo por "caber en el círculo" aunque el polígono real dibujado fuera más pequeño ahí,
+    // dando la sensación de que la suavidad/forma no hace nada.
+    private buildOrganicPolygon(stamp: EraserStamp): Point[] {
+        const { x, y, radius, softness, seed } = stamp;
+        const rand = (salt: string): number => this.hashSeed(`erase:${seed}:${salt}`) / 4294967296;
+        const sides = 12;
+        const wobbleAmount = 0.15 + (softness / 100) * 0.45;
+        const points: Point[] = [];
+        for (let i = 0; i < sides; i++) {
+            const angle = (Math.PI * 2 * i) / sides;
+            const wobble = 1 + (rand(`w${i}`) * 2 - 1) * wobbleAmount;
+            points.push({ x: x + Math.cos(angle) * radius * wobble, y: y + Math.sin(angle) * radius * wobble });
+        }
+        return points;
+    }
+
+    // Manchitas de un sello "disperso": mismo motivo que buildOrganicPolygon, compartido entre dibujo y cobertura.
+    private buildDispersoBlobs(stamp: EraserStamp): { x: number; y: number; radius: number }[] {
+        const { x, y, radius, softness, seed } = stamp;
+        const rand = (salt: string): number => this.hashSeed(`erase:${seed}:${salt}`) / 4294967296;
+        const blobCount = 5 + Math.round((softness / 100) * 6);
+        const spread = 0.2 + (softness / 100) * 0.6;
+        const blobs: { x: number; y: number; radius: number }[] = [];
+        for (let i = 0; i < blobCount; i++) {
+            const angle = rand(`a${i}`) * Math.PI * 2;
+            const distance = rand(`d${i}`) * radius * spread;
+            const blobRadius = radius * (0.2 + rand(`r${i}`) * 0.3);
+            blobs.push({ x: x + Math.cos(angle) * distance, y: y + Math.sin(angle) * distance, radius: blobRadius });
+        }
+        return blobs;
+    }
+
+    // Alcance amplio y barato del pincel (círculo/cuadrado/diamante del radio nominal, SIN el bamboleo/manchitas
+    // reales de orgánico/disperso): para decidir si algo está cerca como para merecer la pena tratarlo (añadirle
+    // un hueco parcial, cortar un trazo, borrar una casa entera), antes de dibujarlo de verdad con drawErasedFill
+    // (que sí usa la forma exacta). Es el comportamiento de siempre (previo a diferenciar orgánico/disperso en
+    // isInsideEraserShape) — si aquí se exigiera ya la forma exacta, casi nada la tocaría con disperso (manchitas
+    // diminutas) y dejaría de reaccionar casi siempre, aunque el pincel sí pasara por encima — visto como
+    // "disperso ya no borra nada". Solo isHexFullyCovered necesita la forma exacta (ver isInsideEraserShape):
+    // decide si un hexágono se vacía DEL TODO, así que ahí sí importa que no se dispare por caber en un círculo
+    // más grande que lo que realmente se ve borrado.
+    private isNearEraserBrush(px: number, py: number, stamp: EraserStamp, margin: number): boolean {
+        const dx = px - stamp.x;
+        const dy = py - stamp.y;
+        const radius = stamp.radius + margin;
+        switch (stamp.shape) {
             case 'cuadrado': return Math.max(Math.abs(dx), Math.abs(dy)) <= radius;
             case 'diamante': return Math.abs(dx) + Math.abs(dy) <= radius;
             default: return Math.hypot(dx, dy) <= radius;
+        }
+    }
+
+    // ¿(px,py) cae dentro del pincel de borrado del sello? Geométrico, sin difuminado: se usa para decidir si un
+    // objeto entero (mancha, trazo, casa) queda dentro del pincel. En orgánico/disperso usa la MISMA forma que se
+    // dibuja (buildOrganicPolygon/buildDispersoBlobs), no un círculo genérico del radio nominal — si no, "cubrir
+    // del todo" un hexágono (ver isHexFullyCovered) se decidiría por un círculo que casi nunca coincide con lo que
+    // realmente se ve borrado, y la suavidad/forma de esos dos pinceles no tendría ningún efecto visible.
+    private isInsideEraserShape(px: number, py: number, stamp: EraserStamp): boolean {
+        const dx = px - stamp.x;
+        const dy = py - stamp.y;
+        switch (stamp.shape) {
+            case 'cuadrado': return Math.max(Math.abs(dx), Math.abs(dy)) <= stamp.radius;
+            case 'diamante': return Math.abs(dx) + Math.abs(dy) <= stamp.radius;
+            case 'circulo': return Math.hypot(dx, dy) <= stamp.radius;
+            case 'organico': return this.isPointInPolygon({ x: px, y: py }, this.buildOrganicPolygon(stamp));
+            default: return this.buildDispersoBlobs(stamp).some((blob) => Math.hypot(px - blob.x, py - blob.y) <= blob.radius);
         }
     }
 
@@ -3478,8 +3600,7 @@ class TerrainEditor {
     // resultado (en círculo/cuadrado/diamante la suavidad no afecta a la forma, se queda limpia).
     // Determinista por stamp.seed: el mismo hueco se repinta siempre igual; cada pasada de borrado usa una seed nueva.
     private drawEraserStampShape(graphic: any, stamp: EraserStamp): void {
-        const { x, y, shape, radius, softness, seed } = stamp;
-        const rand = (salt: string): number => this.hashSeed(`erase:${seed}:${salt}`) / 4294967296;
+        const { x, y, shape, radius } = stamp;
 
         if (shape === 'circulo') {
             graphic.drawCircle(x, y, radius);
@@ -3494,36 +3615,25 @@ class TerrainEditor {
             return;
         }
         if (shape === 'organico') {
-            const sides = 12;
-            const wobbleAmount = 0.15 + (softness / 100) * 0.45;
-            const points: number[] = [];
-            for (let i = 0; i < sides; i++) {
-                const angle = (Math.PI * 2 * i) / sides;
-                const wobble = 1 + (rand(`w${i}`) * 2 - 1) * wobbleAmount;
-                points.push(x + Math.cos(angle) * radius * wobble, y + Math.sin(angle) * radius * wobble);
-            }
-            graphic.drawPolygon(points);
+            graphic.drawPolygon(this.buildOrganicPolygon(stamp).flatMap((point) => [point.x, point.y]));
             return;
         }
         // Disperso: varias manchitas sueltas dentro del radio; más suavidad = más manchitas y más repartidas.
-        const blobCount = 5 + Math.round((softness / 100) * 6);
-        const spread = 0.2 + (softness / 100) * 0.6;
-        for (let i = 0; i < blobCount; i++) {
-            const angle = rand(`a${i}`) * Math.PI * 2;
-            const distance = rand(`d${i}`) * radius * spread;
-            const blobRadius = radius * (0.2 + rand(`r${i}`) * 0.3);
-            graphic.drawCircle(x + Math.cos(angle) * distance, y + Math.sin(angle) * distance, blobRadius);
-        }
+        this.buildDispersoBlobs(stamp).forEach((blob) => graphic.drawCircle(blob.x, blob.y, blob.radius));
     }
 
     // Rellena (con su(s) propio(s) beginFill/endFill) el hueco de un sello de borrado, con difuminado real en
-    // círculo/cuadrado/diamante: en vez de un corte limpio, varios anillos concéntricos con opacidad parcial.
-    // blendMode ERASE reduce la opacidad de destino según la del propio hueco (no es un corte binario), así que
-    // superponer anillos parciales de fuera hacia dentro da un degradado (más "mordido" cuanto más al centro).
-    // Orgánico/disperso no usan anillos: su propia irregularidad ya es "la suavidad" (ver drawEraserStampShape).
+    // en vez de un corte limpio, varios anillos concéntricos con opacidad parcial. blendMode ERASE reduce la
+    // opacidad de destino según la del propio hueco (no es un corte binario), así que superponer anillos
+    // parciales de fuera hacia dentro da un degradado (más "mordido" cuanto más al centro). Funciona igual para
+    // las 5 formas: drawEraserStampShape solo depende linealmente de stamp.radius (drawCircle/drawRect/drawPolygon
+    // con puntos proporcionales al radio; buildOrganicPolygon/buildDispersoBlobs también escalan con él), así que
+    // encoger el radio anillo a anillo reduce toda la silueta (el bamboleo o las manchitas) manteniendo su forma,
+    // igual que reducir un círculo/cuadrado/diamante. En orgánico/disperso la suavidad hace así dos cosas a la
+    // vez: más irregular/repartida la silueta (drawEraserStampShape) Y un borde difuminado de verdad (aquí).
     private drawErasedFill(graphic: any, stamp: EraserStamp): void {
-        const { x, y, shape, radius, softness } = stamp;
-        if (shape !== 'circulo' && shape !== 'cuadrado' && shape !== 'diamante' || softness <= 0) {
+        const { radius, softness } = stamp;
+        if (softness <= 0) {
             graphic.beginFill(0xffffff, 1);
             this.drawEraserStampShape(graphic, stamp);
             graphic.endFill();
@@ -3531,7 +3641,9 @@ class TerrainEditor {
         }
 
         const bandStart = radius * (1 - softness / 100);
-        const rings = 10;
+        // 32 anillos, no 10: con menos se veían bandas concéntricas duras (efecto "a rodajas"/dithering) en vez
+        // de un degradado suave, sobre todo visible de cerca o con la mancha grande.
+        const rings = 32;
         for (let i = rings; i >= 1; i--) {
             const ringRadius = bandStart + (radius - bandStart) * (i / rings);
             graphic.beginFill(0xffffff, 1 / rings);
@@ -3557,16 +3669,35 @@ class TerrainEditor {
         const stamp: EraserStamp = { x: position.x, y: position.y, shape, radius: worldRadius, softness, seed: 1 };
 
         const graphic = new PIXI.Graphics();
+        // Disperso en concreto no traza el radio nominal ni con el pincel completo (cada manchita mide como mucho
+        // la mitad del radio y quedan repartidas dentro, nunca llegan a ocupar el círculo entero): sin esta
+        // referencia tenue no hay forma de ver a qué área corresponde el ajuste "Radio" del panel. En orgánico su
+        // propio contorno sí ronda el radio nominal, así que esta referencia queda casi tapada por él (redundante
+        // pero inofensiva).
+        if (shape === 'organico' || shape === 'disperso') {
+            graphic.lineStyle(1 / this.viewport.scale.x, 0xffffff, 0.15);
+            graphic.drawCircle(position.x, position.y, worldRadius);
+        }
         graphic.lineStyle(1.5 / this.viewport.scale.x, 0xffffff, 0.9);
         this.drawEraserStampShape(graphic, stamp);
-        // En círculo/cuadrado/diamante la suavidad no cambia el contorno exterior, solo difumina el borde hacia
-        // dentro (drawErasedFill): se marca aparte con un contorno interior más tenue, donde el borrado ya es 100% seguro.
-        if (softness > 0 && (shape === 'circulo' || shape === 'cuadrado' || shape === 'diamante')) {
+        // Ahora la suavidad difumina el borde en las 5 formas (ver drawErasedFill), así que el contorno interior
+        // más tenue (el núcleo garantizado, misma fórmula que allí) también aplica a las 5, no solo a
+        // círculo/cuadrado/diamante: en orgánico/disperso es la MISMA silueta bamboleada/repartida pero encogida,
+        // no un círculo ajeno a la forma real.
+        if (softness > 0) {
             graphic.lineStyle(1.5 / this.viewport.scale.x, 0xffffff, 0.35);
             this.drawEraserStampShape(graphic, { ...stamp, radius: worldRadius * (1 - softness / 100) });
         }
         graphic.lineStyle(0);
         this.eraserCursorContainer.addChild(graphic);
+    }
+
+    // Añade un sello a la lista de huecos parciales de un hexágono/trazo, con tope (MAX_ERASED_HOLES_PER_TARGET):
+    // por encima del tope se descartan los más viejos, no el nuevo, para que el borrado siga notándose (si se
+    // descartara el nuevo, seguir pasando el pincel por una zona ya "llena" de sellos no haría nada visible).
+    private appendErasedHole(holes: EraserStamp[] | undefined, stamp: EraserStamp): EraserStamp[] {
+        const next = [...(holes ?? []), stamp];
+        return next.length > MAX_ERASED_HOLES_PER_TARGET ? next.slice(next.length - MAX_ERASED_HOLES_PER_TARGET) : next;
     }
 
     // Caja delimitadora de unos puntos, ampliada por margin: sirve para descartar rápido (sin mirar cada punto)
@@ -3592,6 +3723,16 @@ class TerrainEditor {
         const layer = this.activeLayer;
         const settings = this.eraserSettings;
         const brushRadius = settings.radius * this.radioHex;
+
+        // Espaciado mínimo entre sellos (como la "separación" de un pincel de dibujo): arrastrar dispara un
+        // eraseAt por cada pointermove, y sin este límite un arrastre lento sobre el mismo borde apila cientos de
+        // sellos en el mismo hexágono/trazo (ver lastEraseX/lastEraseY) hasta reventar la memoria al repintar.
+        if (this.lastEraseX !== null && this.lastEraseY !== null && Math.hypot(x - this.lastEraseX, y - this.lastEraseY) < brushRadius * 0.25) {
+            return;
+        }
+        this.lastEraseX = x;
+        this.lastEraseY = y;
+
         let changed = false;
         // Un único sello para todo lo que toque este borrado (hexágonos, perfil libre, río/carretera).
         const stamp: EraserStamp = { x, y, shape: settings.shape, radius: brushRadius, softness: settings.softness, seed: Math.floor(Math.random() * 1000000) };
@@ -3608,7 +3749,7 @@ class TerrainEditor {
             for (let i = 0; i < hexVertices.length; i += 2) {
                 const vx = hexCoordinate.x + hexVertices[i];
                 const vy = hexCoordinate.y + hexVertices[i + 1];
-                if (!this.isInsideEraserShape(vx, vy, x, y, settings.shape, brushRadius)) return false;
+                if (!this.isInsideEraserShape(vx, vy, stamp)) return false;
             }
             return true;
         };
@@ -3631,9 +3772,10 @@ class TerrainEditor {
                     hexData.underlyingTerrain = null;
                     hexData.underlyingColor = null;
                     hexData.erasedHoles = undefined;
+                    hexData.lastEraseStamp = stamp;
                     changed = true;
-                } else if (this.isInsideEraserShape(hexCoordinate.x, hexCoordinate.y, x, y, settings.shape, brushRadius + this.radioHex)) {
-                    hexData.erasedHoles = [...(hexData.erasedHoles ?? []), stamp];
+                } else if (this.isNearEraserBrush(hexCoordinate.x, hexCoordinate.y, stamp, this.radioHex)) {
+                    hexData.erasedHoles = this.appendErasedHole(hexData.erasedHoles, stamp);
                     changed = true;
                 }
             }
@@ -3641,7 +3783,7 @@ class TerrainEditor {
 
         layer.cities.forEach((city, key) => {
             const hexCoordinate = this.mapaHexes[city.col][city.fila];
-            if (!this.isInsideEraserShape(hexCoordinate.x, hexCoordinate.y, x, y, settings.shape, brushRadius)) return;
+            if (!this.isNearEraserBrush(hexCoordinate.x, hexCoordinate.y, stamp, 0)) return;
             city.graphic?.destroy();
             layer.cities.delete(key);
             changed = true;
@@ -3651,7 +3793,7 @@ class TerrainEditor {
         layer.freeWavyStrokes = layer.freeWavyStrokes.map((stroke) => {
             if (!this.boundsOverlapBrush(stroke.points, x, y, brushRadius)) return stroke;
             changed = true;
-            return { ...stroke, erasedHoles: [...(stroke.erasedHoles ?? []), stamp] };
+            return { ...stroke, erasedHoles: this.appendErasedHole(stroke.erasedHoles, stamp) };
         });
 
         // Río/carretera (relleno, igual que el perfil libre) y tren (railes: sin relleno que recortar, así que
@@ -3664,10 +3806,10 @@ class TerrainEditor {
             }
             if (line.kind !== 'tren') {
                 changed = true;
-                remainingLines.push({ ...line, erasedHoles: [...(line.erasedHoles ?? []), stamp] });
+                remainingLines.push({ ...line, erasedHoles: this.appendErasedHole(line.erasedHoles, stamp) });
                 return;
             }
-            const touchedAny = line.points.some((point) => this.isInsideEraserShape(point.x, point.y, x, y, settings.shape, brushRadius));
+            const touchedAny = line.points.some((point) => this.isNearEraserBrush(point.x, point.y, stamp, 0));
             if (!touchedAny) {
                 remainingLines.push(line);
                 return;
@@ -3675,7 +3817,7 @@ class TerrainEditor {
             changed = true;
             const runs: LinePoint[][] = [[]];
             line.points.forEach((point) => {
-                if (this.isInsideEraserShape(point.x, point.y, x, y, settings.shape, brushRadius)) {
+                if (this.isNearEraserBrush(point.x, point.y, stamp, 0)) {
                     if (runs[runs.length - 1].length > 0) runs.push([]);
                 } else {
                     runs[runs.length - 1].push(point);
@@ -3726,6 +3868,9 @@ class TerrainEditor {
             }
             hexData.terreno = this.selectedTerrain;
             hexData.color = this.colores[this.selectedTerrain];
+            // Un borrado anterior sobre esta casilla no debe manchar lo que se pinta ahora encima.
+            hexData.erasedHoles = undefined;
+            hexData.lastEraseStamp = undefined;
             hexData.paintMode = this.paintMode;
             hexData.wavySettings = this.paintMode === 'ondulado' ? { ...this.wavySettings } : null;
             hexData.wavyGrouping = this.paintMode === 'ondulado' ? this.wavyGrouping : null;
